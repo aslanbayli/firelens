@@ -22,7 +22,7 @@ def extract_user_and_repo(repo_url: str):
 
 
 def get_file_content(file_url: str, headers: dict, file_type: str):
-    ALLOWED_FILE_TYPES = ["py", "md", "ipynb", "html"]
+    ALLOWED_FILE_TYPES = ["py", "md", "ipynb", "html", "js"]
     response = requests.get(file_url, headers=headers)
     if response.status_code != 200:
         error_message = response.json().get("message", "Unknown error")
