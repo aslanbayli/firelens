@@ -19,7 +19,8 @@ Whether you're a developer trying to understand a popular open-source project, a
 
 ### Prerequisites
 
-- Python 3.7 or later
+- Python 3.14
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
 - An OpenAI API key (for LLM functionality)
 - GitHub Authentication Token (Optional, increases API rate limit)
 
@@ -32,10 +33,10 @@ Whether you're a developer trying to understand a popular open-source project, a
    cd firelens
    ```
 
-2. Install all of the required packages:
+2. Install all required packages:
 
     ```bash
-    pip install -r requirements.txt
+    uv sync
     ```
     
 3. Add you dev keys to the `.env` file
@@ -62,5 +63,3 @@ After the last command, a new tab in your default browser will open.
 
 ### Example usage
 ![image](https://github.com/aslanbayli/firelens/assets/48028559/1a19f38e-9483-4ec9-ad49-5bf0e3c49198)
-
-

@@ -1,0 +1,13 @@
+[project]
+name = "firelens"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "fastapi[standard]>=0.138,<0.139",
+    "openai>=2.44,<3",
+    "pydantic-settings>=2.3,<3",
+    "requests>=2.32,<3",
+    "streamlit>=1.58,<2",
+]

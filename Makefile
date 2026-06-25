@@ -1,5 +1,5 @@
 server:
-	fastapi dev app/main.py
+	uv run fastapi dev app/main.py
 
 client:
-	streamlit run app/client/streamlit_app.py
+	uv run streamlit run app/client/streamlit_app.py
