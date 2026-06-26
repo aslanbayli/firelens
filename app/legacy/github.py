@@ -1,14 +1,17 @@
 import base64
+
 import requests
 from fastapi import HTTPException
+
 from app.core.config import settings
+
 
 def extract_repo_url(user_input: str) -> str:
     words = user_input.split()
     for word in words:
         if "github.com" in word:
             return word
-    return None
+    return ""
 
 
 def extract_user_and_repo(repo_url: str):

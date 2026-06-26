@@ -1,4 +1,10 @@
+# Python related
 __pycache__
 venv/
-filetree.txt
+.venv/
 .env
+
+# local dev
+firelens2-plan.md
+firelens2-blueprint.md
+main.py

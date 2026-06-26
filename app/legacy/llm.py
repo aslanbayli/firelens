@@ -1,7 +1,9 @@
 import json
+
 from openai import OpenAI
+
 from app.core.config import settings
-from app.services.github import get_github_repo_contents
+from app.legacy.github import get_github_repo_contents
 
 client = OpenAI(api_key=settings.openai_api_key, project=settings.project_id)
 
@@ -72,5 +74,3 @@ def run_conversation(prompt: str):
             messages=messages,
         )  # get a new response from the model where it can see the function response
         return second_response
-
-
