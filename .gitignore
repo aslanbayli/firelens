@@ -8,7 +8,7 @@ venv/
 # local dev
 PLAN.md
 SPEC.md
-script.py
+# script.py
 
 # Data
 data/

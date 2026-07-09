@@ -362,6 +362,82 @@ class SQLiteIndexStore:
             for row in rows
         }
 
+    def find_exact_symbols(
+        self,
+        repository_id: uuid.UUID,
+        query: str,
+        path_filter: str | None = None,
+        limit: int = 10,
+    ) -> list[Symbol]:
+        """Load exact symbol matches in deterministic ranking order."""
+
+        qualified_matches = self._load_symbols_by_column(
+            repository_id=repository_id,
+            column="qualified_name",
+            value=query,
+            path_filter=path_filter,
+        )
+
+        matches = list(qualified_matches)
+        seen_ids = {symbol.id for symbol in matches}
+
+        short_name_matches = self._load_symbols_by_column(
+            repository_id=repository_id,
+            column="name",
+            value=query,
+            path_filter=path_filter,
+        )
+
+        for symbol in short_name_matches:
+            if symbol.id not in seen_ids:
+                matches.append(symbol)
+                seen_ids.add(symbol.id)
+
+        return matches[:limit]
+
+    def _load_symbols_by_column(
+        self,
+        repository_id: uuid.UUID,
+        column: str,
+        value: str,
+        path_filter: str | None = None,
+    ) -> list[Symbol]:
+        """Load symbols where an allowed text column exactly matches a value."""
+
+        allowed_columns = {"name", "qualified_name"}
+        if column not in allowed_columns:
+            raise ValueError(f"Unsupported symbol lookup column: {column}")
+
+        parameters: list[str] = [str(repository_id), value]
+        path_clause = ""
+        if path_filter is not None:
+            path_clause = "AND relative_path = ?"
+            parameters.append(path_filter)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    repository_id,
+                    name,
+                    qualified_name,
+                    kind,
+                    relative_path,
+                    start_line,
+                    end_line,
+                    source_snippet
+                FROM symbols
+                WHERE repository_id = ?
+                    AND {column} = ?
+                    {path_clause}
+                ORDER BY relative_path, qualified_name, start_line
+                """,
+                parameters,
+            ).fetchall()
+
+        return [_symbol_from_row(row) for row in rows]
+
     def load_embeddings_by_content_hash(
         self,
         repository_id: uuid.UUID,
@@ -407,8 +483,7 @@ class SQLiteIndexStore:
             ).fetchall()
 
         return [
-            (uuid.UUID(row["chunk_id"]), unpack_vector(row["vector"]))
-            for row in rows
+            (uuid.UUID(row["chunk_id"]), unpack_vector(row["vector"])) for row in rows
         ]
 
     @staticmethod
@@ -612,4 +687,20 @@ def _repository_from_row(row: sqlite3.Row) -> Repository:
         timestamp_of_index=row["timestamp_of_index"],
         embedding_model=row["embedding_model"],
         embedding_dim=row["embedding_dim"],
+    )
+
+
+def _symbol_from_row(row: sqlite3.Row) -> Symbol:
+    """Build a Symbol model from a SQLite row."""
+
+    return Symbol(
+        id=uuid.UUID(row["id"]),
+        repository_id=uuid.UUID(row["repository_id"]),
+        name=row["name"],
+        qualified_name=row["qualified_name"],
+        kind=row["kind"],
+        relative_path=row["relative_path"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        source_snippet=row["source_snippet"],
     )

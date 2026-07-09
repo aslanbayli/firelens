@@ -69,6 +69,73 @@ class SQLiteIndexStoreTests(unittest.TestCase):
                     embeddings=[],
                 )
 
+    def test_find_exact_symbols_orders_and_filters_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteIndexStore(Path(temp_dir) / "firelens.db")
+            repository, files, symbols, chunks, embeddings = _sample_index()
+            symbols.extend(
+                [
+                    Symbol(
+                        id=uuid.uuid4(),
+                        repository_id=repository.id,
+                        name="run",
+                        qualified_name="Service.run",
+                        kind="method",
+                        relative_path="service.py",
+                        start_line=3,
+                        end_line=4,
+                        source_snippet="    def run(self):\n        pass\n",
+                    ),
+                    Symbol(
+                        id=uuid.uuid4(),
+                        repository_id=repository.id,
+                        name="run",
+                        qualified_name="run",
+                        kind="function",
+                        relative_path="main.py",
+                        start_line=1,
+                        end_line=2,
+                        source_snippet="def run():\n    pass\n",
+                    ),
+                    Symbol(
+                        id=uuid.uuid4(),
+                        repository_id=repository.id,
+                        name="run",
+                        qualified_name="Worker.run",
+                        kind="method",
+                        relative_path="worker.py",
+                        start_line=8,
+                        end_line=9,
+                        source_snippet="    def run(self):\n        pass\n",
+                    ),
+                ]
+            )
+
+            store.initialize()
+            store.replace_index(
+                repository=repository,
+                files=files,
+                symbols=symbols,
+                chunks=chunks,
+                embeddings=embeddings,
+            )
+
+            matches = store.find_exact_symbols(repository.id, "run")
+            filtered_matches = store.find_exact_symbols(
+                repository.id,
+                "run",
+                path_filter="worker.py",
+            )
+
+        self.assertEqual(
+            [symbol.qualified_name for symbol in matches],
+            ["run", "Service.run", "Worker.run"],
+        )
+        self.assertEqual(
+            [symbol.qualified_name for symbol in filtered_matches],
+            ["Worker.run"],
+        )
+
 
 def _sample_index() -> tuple[
     Repository,

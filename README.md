@@ -1,65 +1,177 @@
-# FireLens 🔥
+# FireLens
 
-Have you ever struggled to understand the source code of a complex library, framework, or tool you wanted to use? Navigating through unfamiliar codebases can be a challenge, especially when dealing with large projects or code written by others. That's where FireLens comes in – your AI-powered code comprehension assistant.
+FireLens is a local-first code retrieval engine for Python repositories.
 
-Whether you're a developer trying to understand a popular open-source project, a researcher exploring a new codebase, or a student learning from real-world code examples, FireLens empowers you to quickly grasp the inner workings of any codebase, saving you countless hours of manual code review and exploration.
+It indexes repository symbols, semantic chunks, and embeddings into SQLite so
+other layers can build exact, fuzzy, and semantic search on top of a stable
+local index.
 
-> **TL;DR**
->
-> FireLens is an AI-powered code analysis tool that makes it easier to understand the contents of any public GitHub repository.
+## Current scope
 
-## Features
+- Python-only parsing via the standard library `ast` module
+- SQLite-backed repository index storage
+- Incremental reindexing based on file content changes
+- Embedding reuse when chunk content has not changed
+- Root `.gitignore` support during repository walking
+- Optional progress callbacks for indexing status updates
 
-- **Code Comprehension**: Ask questions about a GitHub repository's codebase, and FireLens will provide clear explanations, powered by OpenAI's GPT-3.5-turbo language model.
-- **GitHub Integration**: Seamlessly fetch and analyze code directly from any public GitHub repository.
-- **User-friendly Interface**: Interact with FireLens through a simple and intuitive Streamlit web interface.
-- **Supported Languages**: Python (more to come).
+FireLens is not a chatbot. Retrieval and indexing are the core product.
 
-## Getting Started
+## Requirements
 
-### Prerequisites
-
-- Python 3.14
+- Python `>=3.14,<3.15`
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- An OpenAI API key (for LLM functionality)
-- GitHub Authentication Token (Optional, increases API rate limit)
 
-### Installation
+For real semantic embeddings, install project dependencies and provide a
+Hugging Face token in `.env` or the shell as `HF_TOKEN` if the model requires
+authentication.
 
-1. Clone the repository:
+## Install
 
-   ```bash
-   git clone https://github.com/aslanbayli/firelens.git
-   cd firelens
-   ```
+```bash
+git clone https://github.com/aslanbayli/firelens.git
+cd firelens
+uv sync
+```
 
-2. Install all required packages:
+## Index a repository
 
-    ```bash
-    uv sync
-    ```
-    
-3. Add you dev keys to the `.env` file
+Use the persisted indexer entrypoint:
 
-4. Start the server:
+```python
+from app.indexing.embedder import CodeRankEmbedder
+from app.indexing.indexer import index_to_sqlite
 
-    ```bash
-    make server
-    ```
+report = index_to_sqlite(
+    "~/projects/firelens",
+    CodeRankEmbedder(),
+)
 
-5. Start the client (in a separate terminal):
+print(report.database_path)
+```
 
-    ```bash
-    make client
-    ```
+This creates a SQLite database under:
 
-After the last command, a new tab in your default browser will open.
-![image](https://github.com/aslanbayli/firelens/assets/48028559/78d438ee-723c-4e14-82b1-fcb8174bc433)
+```text
+data/indexes/<repository-key>/firelens.db
+```
 
-## Potential improvements
-- Add support for repositories written in programming langauges other than Python
-- Ability to choose between different LLMs (Currently supports GPT-3.5-turbo)
-- More complex actions such as getting information about open issues on the repo, or looking up additional information using StackOverflow.
+The index contains:
 
-### Example usage
-![image](https://github.com/aslanbayli/firelens/assets/48028559/1a19f38e-9483-4ec9-ad49-5bf0e3c49198)
+- `repositories`: repository metadata and embedding compatibility info
+- `files`: indexed file metadata and content hashes
+- `symbols`: parsed functions, classes, and methods
+- `chunks`: semantic-search source chunks
+- `embeddings`: serialized embedding vectors
+
+## Incremental indexing
+
+Reindexing the same repository does not rebuild everything.
+
+FireLens now:
+
+- reuses the same persisted repository identity
+- hashes current files and compares them to stored file metadata
+- parses and embeds only added or changed files
+- removes records for deleted files
+- reuses stored embeddings when chunk content hashes still match
+- preserves previous valid records if a changed file fails parsing
+
+## Progress reporting
+
+`index_to_sqlite()` accepts an optional `progress_callback` so callers can
+render indexing progress in a CLI, Streamlit UI, or logs.
+
+```python
+from app.indexing.embedder import CodeRankEmbedder
+from app.indexing.indexer import index_to_sqlite
+
+def show_progress(event):
+    print(f"[{event.stage}] {event.current}/{event.total} {event.message}")
+
+report = index_to_sqlite(
+    "~/projects/firelens",
+    CodeRankEmbedder(),
+    progress_callback=show_progress,
+)
+```
+
+Progress stages currently include:
+
+- `load`
+- `walk`
+- `compare`
+- `index`
+- `write`
+- `complete`
+
+## `.gitignore` behavior
+
+If the indexed repository contains a root `.gitignore`, FireLens excludes
+matching paths while walking the tree. The current implementation supports the
+common cases needed for repository indexing:
+
+- comments and blank lines
+- directory rules such as `build/`
+- anchored rules such as `/generated.py`
+- glob rules such as `*.generated.py`
+- negation rules such as `!keep.py`
+
+FireLens also ignores built-in paths such as `.git`, virtualenv directories,
+`node_modules`, caches, build outputs, and the local `data` directory.
+
+## Embeddings
+
+The real semantic embedder is `CodeRankEmbedder`, which loads:
+
+```text
+nomic-ai/CodeRankEmbed
+```
+
+through `sentence-transformers`.
+
+The model runs locally through PyTorch. On Apple Silicon, that typically means
+`mps` when available, otherwise CPU. Model files are cached by Hugging Face in
+the user cache directory unless overridden by environment variables such as
+`HF_HOME` or `TRANSFORMERS_CACHE`.
+
+For tests and pipeline validation, `FakeEmbedder` provides deterministic
+normalized vectors without requiring any model downloads.
+
+## Inspect the SQLite index
+
+```bash
+sqlite3 data/indexes/<repository-key>/firelens.db
+```
+
+Useful queries:
+
+```sql
+.tables
+
+SELECT COUNT(*) FROM files;
+SELECT COUNT(*) FROM symbols;
+SELECT COUNT(*) FROM chunks;
+SELECT COUNT(*) FROM embeddings;
+
+SELECT name, qualified_name, kind, relative_path, start_line, end_line
+FROM symbols
+LIMIT 20;
+```
+
+## Run tests
+
+```bash
+uv run python -m unittest \
+  tests.test_indexing_basics \
+  tests.test_storage_database \
+  tests.test_indexing_persistence
+```
+
+## Near-term gaps
+
+- Semantic search execution is not wired yet; vectors are persisted for the
+  upcoming search layer.
+- Only Python repositories are parsed today.
+- `.gitignore` support is intentionally lightweight and limited to the root
+  `.gitignore` file.
