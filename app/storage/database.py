@@ -362,7 +362,7 @@ class SQLiteIndexStore:
             for row in rows
         }
 
-    def find_exact_symbols(
+    def exact_search_symbols(
         self,
         repository_id: uuid.UUID,
         query: str,
@@ -394,6 +394,39 @@ class SQLiteIndexStore:
                 seen_ids.add(symbol.id)
 
         return matches[:limit]
+
+    def load_all_symbols(
+        self, repository_id: uuid.UUID, path_filter: str | None = None
+    ) -> list[Symbol]:
+        """Load all symbols for a repository, optionally filtered by path."""
+        parameters: list[str] = [str(repository_id)]
+        path_clause = ""
+        if path_filter is not None:
+            path_clause = "AND relative_path = ?"
+            parameters.append(path_filter)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    repository_id,
+                    name,
+                    qualified_name,
+                    kind,
+                    relative_path,
+                    start_line,
+                    end_line,
+                    source_snippet
+                FROM symbols
+                WHERE repository_id = ?
+                    {path_clause}
+                ORDER BY relative_path, qualified_name, start_line
+                """,
+                parameters,
+            ).fetchall()
+
+        return [_symbol_from_row(row) for row in rows]
 
     def _load_symbols_by_column(
         self,

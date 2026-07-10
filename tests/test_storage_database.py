@@ -69,7 +69,7 @@ class SQLiteIndexStoreTests(unittest.TestCase):
                     embeddings=[],
                 )
 
-    def test_find_exact_symbols_orders_and_filters_matches(self) -> None:
+    def test_exact_search_symbols_orders_and_filters_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteIndexStore(Path(temp_dir) / "firelens.db")
             repository, files, symbols, chunks, embeddings = _sample_index()
@@ -120,8 +120,8 @@ class SQLiteIndexStoreTests(unittest.TestCase):
                 embeddings=embeddings,
             )
 
-            matches = store.find_exact_symbols(repository.id, "run")
-            filtered_matches = store.find_exact_symbols(
+            matches = store.exact_search_symbols(repository.id, "run")
+            filtered_matches = store.exact_search_symbols(
                 repository.id,
                 "run",
                 path_filter="worker.py",

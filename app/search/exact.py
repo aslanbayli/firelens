@@ -1,7 +1,7 @@
-"""Pseudocode for the Python exact-search flow.
+"""Python exact-search flow.
 
-This module should eventually own request handling, timing, and conversion from
-stored Symbol records into SearchResult records. It should not contain SQL.
+This module owns request handling, timing, and conversion from
+stored Symbol records into SearchResult records. It does not contain SQL.
 """
 
 import time
@@ -11,7 +11,7 @@ from app.core.models import SearchRequest, SearchResponse, SearchResult
 from app.storage.database import SQLiteIndexStore
 
 
-def search_exact(
+def exact_search(
     store: SQLiteIndexStore,
     repository_id: uuid.UUID,
     request: SearchRequest,
@@ -39,7 +39,7 @@ def search_exact(
 
     # Ask the storage layer for already-ordered exact matches. Storage owns
     # raw SQL and should rank qualified-name matches before short-name matches.
-    symbols = store.find_exact_symbols(
+    symbols = store.exact_search_symbols(
         repository_id=repository_id,
         query=query,
         path_filter=request.path,
