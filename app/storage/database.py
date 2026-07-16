@@ -333,6 +333,38 @@ class SQLiteIndexStore:
 
         return _repository_from_row(row)
 
+    def list_compatible_repositories(
+        self,
+        index_format_version: str,
+        embedding_model: str,
+        embedding_dim: int,
+    ) -> list[Repository]:
+        """Load compatible repository records from this index database."""
+
+        if not self.db_path.exists():
+            return []
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    absolute_path,
+                    index_format_version,
+                    timestamp_of_index,
+                    embedding_model,
+                    embedding_dim
+                FROM repositories
+                WHERE index_format_version = ?
+                    AND embedding_model = ?
+                    AND embedding_dim = ?
+                ORDER BY absolute_path, timestamp_of_index DESC
+                """,
+                (index_format_version, embedding_model, embedding_dim),
+            ).fetchall()
+
+        return [_repository_from_row(row) for row in rows]
+
     def load_files(self, repository_id: uuid.UUID) -> dict[str, IndexedFile]:
         """Load file metadata keyed by repository-relative path."""
 
