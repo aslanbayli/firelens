@@ -66,6 +66,15 @@ def unpack_vector(blob: bytes) -> list[float]:
     return list(values)
 
 
+@dataclass(frozen=True)
+class StoredSemanticCandidate:
+    """Represents a semantic candidate stored in the database."""
+
+    chunk: Chunk
+    vector: list[float]
+    qualified_symbol_name: str | None = None
+
+
 class SQLiteIndexStore:
     """Store and load one FireLens SQLite index database."""
 
@@ -459,6 +468,68 @@ class SQLiteIndexStore:
             ).fetchall()
 
         return [_symbol_from_row(row) for row in rows]
+
+    def load_semantic_candidates(
+        self, repository_id: uuid.UUID, path_filter: str | None = None
+    ) -> list[StoredSemanticCandidate]:
+        parameters: list[str] = [str(repository_id)]
+        path_clause = ""
+        if path_filter is not None:
+            path_clause = "AND chunks.relative_path = ?"
+            parameters.append(path_filter)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    chunks.id,
+                    chunks.repository_id,
+                    chunks.relative_path,
+                    chunks.start_line,
+                    chunks.end_line,
+                    chunks.symbol_id,
+                    chunks.raw_text,
+                    chunks.content_hash,
+                    embeddings.vector AS embedding_vector,
+                    symbols.qualified_name AS qualified_symbol_name
+                FROM chunks
+                INNER JOIN embeddings
+                    ON embeddings.chunk_id = chunks.id
+                LEFT JOIN symbols
+                    ON symbols.id = chunks.symbol_id
+                WHERE chunks.repository_id = ?
+                    {path_clause}
+                ORDER BY
+                    chunks.relative_path,
+                    chunks.start_line,
+                    chunks.end_line,
+                    chunks.id
+                """,
+                parameters,
+            ).fetchall()
+
+            candidates = []
+            for row in rows:
+                chunk = Chunk(
+                    id=uuid.UUID(row["id"]),
+                    repository_id=uuid.UUID(row["repository_id"]),
+                    relative_path=row["relative_path"],
+                    start_line=row["start_line"],
+                    end_line=row["end_line"],
+                    symbol_id=uuid.UUID(row["symbol_id"]) if row["symbol_id"] else None,
+                    raw_text=row["raw_text"],
+                    content_hash=row["content_hash"],
+                )
+
+                candidates.append(
+                    StoredSemanticCandidate(
+                        chunk=chunk,
+                        vector=unpack_vector(row["embedding_vector"]),
+                        qualified_symbol_name=row["qualified_symbol_name"],
+                    )
+                )
+
+            return candidates
 
     def _load_symbols_by_column(
         self,

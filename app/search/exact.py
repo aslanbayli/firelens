@@ -35,7 +35,7 @@ def exact_search(
 
     # Start timing after cheap validation so elapsed_time represents the
     # retrieval path.
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     # Ask the storage layer for already-ordered exact matches. Storage owns
     # raw SQL and should rank qualified-name matches before short-name matches.
@@ -70,7 +70,7 @@ def exact_search(
         original_query=request.query,
         mode="exact",
         backend="python",
-        elapsed_time=time.time() - start_time,
+        elapsed_time=time.perf_counter() - start_time,
         ranked_results=results,
         warnings=[],
     )

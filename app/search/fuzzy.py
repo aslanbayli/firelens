@@ -37,7 +37,7 @@ def fuzzy_search(
 
     # Start timing after cheap validation so elapsed_time represents the
     # retrieval path.
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     # Get all symbols in the database for the given repo and optionally path
     all_symbols = store.load_all_symbols(
@@ -92,7 +92,7 @@ def fuzzy_search(
         original_query=request.query,
         mode="fuzzy",
         backend="python",
-        elapsed_time=time.time() - start_time,
+        elapsed_time=time.perf_counter() - start_time,
         ranked_results=results,
         warnings=[],
     )

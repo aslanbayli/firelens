@@ -1,4 +1,4 @@
-"""Minimal Streamlit interface for exact and fuzzy symbol search."""
+"""Streamlit interface for exact, fuzzy, and semantic code search."""
 
 import sys
 from pathlib import Path
@@ -16,6 +16,7 @@ from app.indexing.embedder import CodeRankEmbedder
 from app.indexing.indexer import IndexingProgress, index_to_sqlite
 from app.search.exact import exact_search
 from app.search.fuzzy import fuzzy_search
+from app.search.semantic import semantic_search
 from app.storage.database import SQLiteIndexStore, default_database_path
 
 INDEX_FORMAT_VERSION = "1"
@@ -67,14 +68,14 @@ def main() -> None:
 
     mode = st.segmented_control(
         "Mode",
-        options=["exact", "fuzzy"],
+        options=["exact", "fuzzy", "semantic"],
         default="exact",
     )
     query = st.text_input("Search")
 
     left_column, right_column = st.columns([1, 1])
     with left_column:
-        top_k = st.number_input("Results", min_value=1, max_value=50, value=10)
+        top_k = st.number_input("Results", min_value=1, max_value=50, value=5)
     with right_column:
         path_filter = st.text_input("Path filter")
 
@@ -132,7 +133,9 @@ def run_index(repository_path: str, database_path: str) -> None:
     embedder = get_embedder()
 
     def show_progress(event: IndexingProgress) -> None:
-        progress_area.caption(f"{event.stage}: {event.current}/{event.total} {event.message}")
+        progress_area.caption(
+            f"{event.stage}: {event.current}/{event.total} {event.message}"
+        )
 
     with st.spinner("Indexing"):
         report = index_to_sqlite(
@@ -180,7 +183,18 @@ def run_search(
     if request.request_mode == "exact":
         return exact_search(store, repository_id, request)
 
-    return fuzzy_search(store, repository_id, request)
+    if request.request_mode == "fuzzy":
+        return fuzzy_search(store, repository_id, request)
+
+    if request.request_mode == "semantic":
+        return semantic_search(
+            store,
+            repository_id,
+            request,
+            get_embedder(),
+        )
+
+    raise ValueError(f"Unsupported search mode: {request.request_mode}")
 
 
 def render_response(response) -> None:

@@ -25,3 +25,5 @@ Do not route new FireLens 2 behavior through legacy GitHub or LLM modules.
 ## Commit message suggestions
 
 When asked to provide a commit name/title, use a Conventional Commits-style prefix such as `feat:`, `fix:`, `chore:`, `docs:`, `test:`, or `refactor:`. Choose the prefix that best matches the change, and keep the title concise.
+
+When making commits NEVER add your agent name as a contributor.

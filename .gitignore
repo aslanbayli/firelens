@@ -6,9 +6,10 @@ venv/
 .DS_Store
 
 # local dev
-PLAN.md
-SPEC.md
-# script.py
+*.md
+!README.md
+!AGENTS.md
+!LICENSE.md
 
 # Data
 data/

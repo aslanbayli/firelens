@@ -15,9 +15,6 @@ DEFAULT_IGNORED_NAMES = {
     "venv",
     "node_modules",
     "__pycache__",
-    "build",
-    "dist",
-    "data",
 }
 
 # FireLens currently parses only Python using the standard-library AST. Files
@@ -70,9 +67,8 @@ class GitIgnoreRule:
                 return any(fnmatch(parent, self.pattern) for parent in parent_paths)
             elif "/" in self.pattern:
                 parent_path = "/".join(parent_parts)
-                return (
-                    fnmatch(parent_path, self.pattern)
-                    or fnmatch(parent_path, f"*/{self.pattern}")
+                return fnmatch(parent_path, self.pattern) or fnmatch(
+                    parent_path, f"*/{self.pattern}"
                 )
             return any(fnmatch(part, self.pattern) for part in parent_parts)
 

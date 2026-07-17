@@ -43,7 +43,11 @@ class Embedder(Protocol):
         ...
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        """Return exactly one fixed-length vector for each input string."""
+        """Return one normalized fixed-length vector for each input string."""
+        ...
+
+    def embed_query(self, query: str) -> list[float]:
+        """Return a single fixed-length vector for the input query string."""
         ...
 
 
@@ -72,6 +76,10 @@ class FakeEmbedder:
         # The list comprehension calls the deterministic single-text algorithm
         # once per item and returns vectors in exactly the same order as texts.
         return [self._embed_one(text) for text in texts]
+
+    def embed_query(self, query: str) -> list[float]:
+        """Return a single fixed-length vector for the input query string."""
+        return self._embed_one(query.strip())
 
     def _embed_one(self, text: str) -> list[float]:
         """Convert one string into a deterministic unit-length vector."""
@@ -120,6 +128,10 @@ class CodeRankEmbedder:
     # The model string must match the Hugging Face model identifier exactly so
     # vectors can be traced back to the model that produced them.
     model = "nomic-ai/CodeRankEmbed"
+
+    # According to the docs the query prompt must include the following
+    # task instruction prefix: "Represent this query for searching relevant code"
+    CODE_SEARCH_QUERY_INSTRUCTION = "Represent this query for searching relevant code: "
 
     def __init__(
         self,
@@ -220,6 +232,30 @@ class CodeRankEmbedder:
 
         # Return vectors in the same order as the input texts.
         return vectors
+
+    def embed_query(self, query: str) -> list[float]:
+        """Return a single fixed-length vector for the input query string."""
+        query = query.strip()
+        if query == "":
+            raise ValueError("Query must not be empty")
+
+        query = self.CODE_SEARCH_QUERY_INSTRUCTION + query
+        model = self._load_model()
+        embeddings = model.encode(
+            [query],
+            batch_size=self.batch_size,
+            normalize_embeddings=self.normalize_embeddings,
+            convert_to_numpy=False,
+        )
+        vector = self._to_float_list(embeddings[0])
+
+        validate_embeddings(
+            [query],
+            [vector],
+            self.dimension,
+        )
+
+        return vector
 
     def _load_model(self) -> Any:
         """Load and cache the Hugging Face sentence-transformers model."""
@@ -342,3 +378,15 @@ def validate_embeddings(
         # incompatibility.
         if len(vector) != expected_dimension:
             raise ValueError("Embedder returned a vector with the wrong dimension")
+
+        magnitude_squared = 0.0
+        for value in vector:
+            if not math.isfinite(value):
+                raise ValueError("Embedder returned a non-finite value")
+            magnitude_squared += value * value
+
+        if magnitude_squared == 0:
+            raise ValueError("Embedder returned a zero vector")
+
+        if not math.isclose(magnitude_squared, 1.0, rel_tol=1e-5, abs_tol=1e-6):
+            raise ValueError("Embedder returned a vector that is not normalized")
