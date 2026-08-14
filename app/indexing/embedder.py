@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 class Embedder(Protocol):
     """Behavior every embedding implementation must provide."""
 
@@ -127,7 +130,9 @@ class CodeRankEmbedder:
 
     # The model string must match the Hugging Face model identifier exactly so
     # vectors can be traced back to the model that produced them.
-    model = "nomic-ai/CodeRankEmbed"
+    DEFAULT_MODEL = "nomic-ai/CodeRankEmbed"
+    DEFAULT_REVISION = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
+    model = f"{DEFAULT_MODEL}@{DEFAULT_REVISION}"
 
     # According to the docs the query prompt must include the following
     # task instruction prefix: "Represent this query for searching relevant code"
@@ -146,10 +151,19 @@ class CodeRankEmbedder:
         # hf_token lets tests or callers inject a token directly. When it is
         # None, the embedder reads HF_TOKEN from the environment or .env.
         hf_token: str | None = None,
+        # model allows an explicitly configured compatible model identifier.
+        model: str = DEFAULT_MODEL,
+        # Pin remote custom code and weights to an immutable repository commit.
+        revision: str | None = DEFAULT_REVISION,
     ) -> None:
+        if not model.strip():
+            raise ValueError("model must not be empty")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
+        self.model_repository = model.strip()
+        self.revision = revision.strip() if revision is not None else None
+        self.model = embedding_model_identity(self.model_repository, self.revision)
         self.batch_size = batch_size
         self.normalize_embeddings = normalize_embeddings
         self.device = device
@@ -279,12 +293,18 @@ class CodeRankEmbedder:
 
         # trust_remote_code=True is required by the Hugging Face snippet for
         # this model because the repository provides custom model code.
-        self._model = SentenceTransformer(
-            self.model,
-            trust_remote_code=True,
-            device=self.device,
-            token=self.hf_token,
-        )
+        try:
+            self._model = SentenceTransformer(
+                self.model_repository,
+                trust_remote_code=True,
+                device=self.device,
+                token=self.hf_token,
+                revision=self.revision,
+            )
+        except Exception as error:
+            raise RuntimeError(
+                f"Unable to load embedding model {self.model}: {error}"
+            ) from error
 
         return self._model
 
@@ -316,7 +336,7 @@ def _load_hf_token() -> str | None:
     # For local development, read the repository-level .env file directly.
     # This keeps CodeRankEmbedder independent from app.core.config, whose
     # settings currently include unrelated required OpenAI/project fields.
-    env_path = Path(".env")
+    env_path = PROJECT_ROOT / ".env"
 
     # No .env means unauthenticated Hugging Face downloads are still allowed.
     if not env_path.exists():
@@ -355,6 +375,21 @@ def _load_hf_token() -> str | None:
 
     # The .env file exists but does not contain a recognized token key.
     return None
+
+
+def embedding_model_identity(model: str, revision: str | None) -> str:
+    """Return the immutable model identity persisted with an index."""
+
+    normalized_model = model.strip()
+    if not normalized_model:
+        raise ValueError("model must not be empty")
+    if revision is None:
+        return normalized_model
+
+    normalized_revision = revision.strip()
+    if not normalized_revision:
+        raise ValueError("revision must not be empty")
+    return f"{normalized_model}@{normalized_revision}"
 
 
 def validate_embeddings(

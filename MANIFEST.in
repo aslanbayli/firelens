@@ -1,0 +1,1 @@
+include tests/stdio_fake_server.py

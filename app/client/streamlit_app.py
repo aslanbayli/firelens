@@ -1,9 +1,7 @@
-"""Streamlit interface for exact, fuzzy, and semantic code search."""
+"""Streamlit interface for indexing and searching local code repositories."""
 
 import sys
 from pathlib import Path
-from typing import Any
-from uuid import UUID
 
 import streamlit as st
 
@@ -11,21 +9,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.core.models import SearchRequest
-from app.indexing.embedder import CodeRankEmbedder
-from app.indexing.indexer import IndexingProgress, index_to_sqlite
-from app.search.exact import exact_search
-from app.search.fuzzy import fuzzy_search
-from app.search.semantic import semantic_search
-from app.storage.database import SQLiteIndexStore, default_database_path
-
-INDEX_FORMAT_VERSION = "1"
+from app.core.config import settings
+from app.core.runtime import FireLensRuntime, build_runtime
+from app.indexing.indexer import IndexingProgress
+from app.indexing.service import AvailableIndex
 
 
 def main() -> None:
     st.set_page_config(page_title="FireLens", layout="wide")
-
     st.title("FireLens")
+
+    runtime = get_runtime()
 
     with st.sidebar:
         source = st.radio(
@@ -34,176 +28,201 @@ def main() -> None:
         )
 
         if source == "Existing index":
-            selected = choose_existing_index()
+            selected = choose_existing_index(runtime)
             if selected is None:
                 st.info("No compatible indexes found.")
                 return
 
-            repository_path = selected["repository_path"]
-            database_path = selected["database_path"]
-            repository_id = selected["repository_id"]
-            st.caption(database_path)
+            repository_path = selected.repository_path
+            st.caption(f"Database: {selected.database_path}")
+            st.caption(
+                f"Model: {selected.embedding_provider}/"
+                f"{selected.embedding_model} "
+                f"({selected.embedding_dim} dimensions)"
+            )
         else:
             repository_path = st.text_input(
                 "Repository path",
                 value=str(PROJECT_ROOT),
             )
-            database_path = st.text_input(
-                "Index database",
-                value=str(default_database_path(repository_path)),
-            )
-            repository_id = None
+            st.caption(f"Indexes are stored under {settings.data_dir}")
 
-        if st.button("Index / Re-index", use_container_width=True):
-            run_index(repository_path, database_path)
-
-    store = SQLiteIndexStore(database_path)
-    repository = load_repository(store, repository_path)
-
-    if repository is None:
-        st.info("No compatible CodeRank index found. Use the Index button first.")
-        return
-
-    repository_id = repository_id or repository.id
+        left_action, right_action = st.columns(2)
+        with left_action:
+            if st.button("Check status", use_container_width=True):
+                show_index_status(runtime, repository_path)
+        with right_action:
+            if st.button("Index / Re-index", use_container_width=True):
+                run_index(runtime, repository_path)
 
     mode = st.segmented_control(
         "Mode",
-        options=["exact", "fuzzy", "semantic"],
-        default="exact",
+        options=["auto", "exact", "fuzzy", "semantic"],
+        default="auto",
     )
     query = st.text_input("Search")
 
-    left_column, right_column = st.columns([1, 1])
-    with left_column:
-        top_k = st.number_input("Results", min_value=1, max_value=50, value=5)
-    with right_column:
-        path_filter = st.text_input("Path filter")
+    results_column, backend_column, snippet_column = st.columns(3)
+    with results_column:
+        top_k = st.number_input(
+            "Results",
+            min_value=1,
+            max_value=settings.max_top_k,
+            value=min(5, settings.max_top_k),
+        )
+    with backend_column:
+        backend = st.selectbox(
+            "Backend",
+            options=["auto", "python", "mojo"],
+            index=0,
+        )
+    with snippet_column:
+        max_snippet_chars = st.number_input(
+            "Maximum snippet characters",
+            min_value=1,
+            max_value=settings.max_snippet_chars,
+            value=min(
+                settings.default_max_snippet_chars,
+                settings.max_snippet_chars,
+            ),
+        )
+
+    path_filter = st.text_input("Path filter")
 
     if query:
-        request = SearchRequest(
-            query=query,
-            request_mode=mode,
-            top_k=int(top_k),
-            path=path_filter.strip() or None,
-            backend="python",
-        )
-        response = run_search(store, repository_id, request)
+        try:
+            response = runtime.search_code(
+                repository_path=repository_path,
+                query=query,
+                mode=mode or "auto",
+                top_k=int(top_k),
+                path=path_filter.strip() or None,
+                backend=backend,
+                max_snippet_chars=int(max_snippet_chars),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            st.error(str(error))
+            return
+
         render_response(response)
 
 
-def choose_existing_index() -> dict[str, Any] | None:
-    options = find_existing_indexes()
+def choose_existing_index(runtime: FireLensRuntime) -> AvailableIndex | None:
+    options = find_existing_indexes(runtime)
     if not options:
         return None
 
-    labels = [option["label"] for option in options]
-    selected_label = st.selectbox("Index", labels)
+    return st.selectbox(
+        "Index",
+        options=options,
+        format_func=lambda option: (
+            f"{Path(option.repository_path).name} - {option.repository_path}"
+        ),
+    )
 
-    return options[labels.index(selected_label)]
+
+def find_existing_indexes(runtime: FireLensRuntime) -> list[AvailableIndex]:
+    """Return persisted indexes available through the shared runtime."""
+
+    return runtime.list_available_indexes()
 
 
-def find_existing_indexes() -> list[dict[str, Any]]:
-    embedder = get_embedder()
-    options: list[dict[str, Any]] = []
+def show_index_status(runtime: FireLensRuntime, repository_path: str) -> None:
+    try:
+        with st.spinner("Checking index freshness"):
+            status = runtime.get_index_status(repository_path)
+    except (OSError, RuntimeError, ValueError) as error:
+        st.error(str(error))
+        return
 
-    for database_path in sorted((PROJECT_ROOT / "data/indexes").glob("*/firelens.db")):
-        store = SQLiteIndexStore(database_path)
-        repositories = store.list_compatible_repositories(
-            index_format_version=INDEX_FORMAT_VERSION,
-            embedding_model=embedder.model,
-            embedding_dim=embedder.dimension,
+    message = (
+        f"{status.status}: {status.file_count} files, "
+        f"{status.symbol_count} symbols, {status.chunk_count} chunks"
+    )
+    if status.status == "ready":
+        st.success(message)
+    elif status.status == "missing":
+        st.info(message)
+    else:
+        st.warning(message)
+
+    if status.changed_paths:
+        st.caption(
+            f"{status.added_file_count} added, "
+            f"{status.changed_file_count} changed, "
+            f"{status.deleted_file_count} deleted"
         )
+        with st.expander("Changed paths"):
+            for path in status.changed_paths:
+                st.write(path)
 
-        for repository in repositories:
-            path = Path(repository.absolute_path)
-            options.append(
-                {
-                    "label": f"{path.name} - {repository.absolute_path}",
-                    "repository_path": repository.absolute_path,
-                    "database_path": str(database_path),
-                    "repository_id": repository.id,
-                }
-            )
-
-    return options
+    for warning in status.warnings:
+        st.warning(warning)
 
 
-def run_index(repository_path: str, database_path: str) -> None:
-    progress_area = st.empty()
-    embedder = get_embedder()
+def run_index(runtime: FireLensRuntime, repository_path: str) -> None:
+    progress_bar = st.progress(0.0, text="Starting index")
 
     def show_progress(event: IndexingProgress) -> None:
-        progress_area.caption(
-            f"{event.stage}: {event.current}/{event.total} {event.message}"
+        fraction = 0.0 if event.total <= 0 else event.current / event.total
+        progress_bar.progress(
+            min(max(fraction, 0.0), 1.0),
+            text=f"{event.stage}: {event.message}",
         )
 
-    with st.spinner("Indexing"):
-        report = index_to_sqlite(
-            repository_path,
-            embedder,
-            database_path,
-            progress_callback=show_progress,
-        )
+    try:
+        with st.spinner("Indexing"):
+            report = runtime.index_repository(
+                repository_path,
+                progress_callback=show_progress,
+            )
+    except (OSError, RuntimeError, ValueError) as error:
+        progress_bar.empty()
+        st.error(str(error))
+        return
 
-    st.success(
-        (
-            f"Indexed {report.symbol_count} symbols, {report.chunk_count} chunks, "
-            f"{report.embedding_count} embeddings."
-        )
+    progress_bar.progress(1.0, text="Indexing complete")
+    message = (
+        f"Indexed {report.file_count} files, {report.symbol_count} symbols, "
+        f"{report.chunk_count} chunks, and {report.embedding_count} embeddings "
+        f"in {report.elapsed_time:.1f} seconds."
+    )
+    if report.status == "ready":
+        st.success(message)
+    else:
+        st.warning(f"{message} The index remains stale because some files failed.")
+
+    st.caption(
+        f"{report.added_file_count} added, "
+        f"{report.changed_file_count} changed, "
+        f"{report.deleted_file_count} deleted; "
+        f"{report.reused_embedding_count} embeddings reused"
     )
 
     if report.errors:
-        with st.expander("Indexing errors"):
+        with st.expander(f"Indexing errors ({report.error_count})"):
             for error in report.errors:
                 st.write(f"{error.relative_path}: {error.stage}: {error.message}")
 
-
-def load_repository(store: SQLiteIndexStore, repository_path: str):
-    root = Path(repository_path).expanduser().resolve()
-    embedder = get_embedder()
-
-    return store.load_repository_by_identity(
-        absolute_path=str(root),
-        index_format_version=INDEX_FORMAT_VERSION,
-        embedding_model=embedder.model,
-        embedding_dim=embedder.dimension,
-    )
+    for warning in report.warnings:
+        st.warning(warning)
 
 
 @st.cache_resource
-def get_embedder() -> CodeRankEmbedder:
-    return CodeRankEmbedder()
-
-
-def run_search(
-    store: SQLiteIndexStore,
-    repository_id: UUID,
-    request: SearchRequest,
-):
-    if request.request_mode == "exact":
-        return exact_search(store, repository_id, request)
-
-    if request.request_mode == "fuzzy":
-        return fuzzy_search(store, repository_id, request)
-
-    if request.request_mode == "semantic":
-        return semantic_search(
-            store,
-            repository_id,
-            request,
-            get_embedder(),
-        )
-
-    raise ValueError(f"Unsupported search mode: {request.request_mode}")
+def get_runtime() -> FireLensRuntime:
+    return build_runtime()
 
 
 def render_response(response) -> None:
     st.caption(
-        (
-            f"{len(response.ranked_results)} results in "
-            f"{response.elapsed_time * 1000:.1f} ms"
-        )
+        f"{len(response.ranked_results)} results in "
+        f"{response.elapsed_time * 1000:.1f} ms · "
+        f"mode {response.requested_mode} → {response.mode} · "
+        f"backend {response.requested_backend} → {response.backend}"
     )
+
+    for warning in response.warnings:
+        st.warning(warning)
 
     for index, result in enumerate(response.ranked_results, start=1):
         label = (
@@ -212,7 +231,13 @@ def render_response(response) -> None:
             f"score {result.score:.2f}"
         )
         with st.expander(label):
-            st.code(result.snippet, language="python")
+            if result.snippet_truncated:
+                st.caption("Snippet truncated to the configured output limit.")
+            st.code(result.snippet, language=_language_for_path(result.file_path))
+
+
+def _language_for_path(file_path: str) -> str:
+    return "python" if Path(file_path).suffix == ".py" else "text"
 
 
 if __name__ == "__main__":

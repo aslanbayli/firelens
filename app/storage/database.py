@@ -10,11 +10,16 @@ import re
 import sqlite3
 import uuid
 from array import array
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Iterator
 
 from app.core.models import Chunk, Repository, Symbol
+
+
+class SearchCandidateLimitError(ValueError):
+    """Raised when a retrieval mode cannot safely rank the full candidate set."""
 
 
 @dataclass(frozen=True)
@@ -38,18 +43,29 @@ class IndexedFileRecords:
     embeddings: list[list[float]]
 
 
-def default_database_path(repository_root: str | Path) -> Path:
+def default_database_path(
+    repository_root: str | Path,
+    data_directory: str | Path | None = None,
+) -> Path:
     """Return the conventional SQLite path for a repository root."""
 
     root = Path(repository_root).expanduser().resolve()
     readable_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", root.name).strip("-")
     if not readable_name:
         readable_name = "repository"
+    # Keep the generated directory component well below common NAME_MAX
+    # limits even when the source directory itself has a 255-byte name.
+    readable_name = readable_name[:64]
 
     path_hash = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
     repository_key = f"{readable_name}-{path_hash}"
 
-    return Path("data") / "indexes" / repository_key / "firelens.db"
+    index_root = (
+        Path(data_directory)
+        if data_directory is not None
+        else Path("data") / "indexes"
+    )
+    return index_root / repository_key / "firelens.db"
 
 
 def pack_vector(vector: Iterable[float]) -> bytes:
@@ -67,12 +83,42 @@ def unpack_vector(blob: bytes) -> list[float]:
 
 
 @dataclass(frozen=True)
-class StoredSemanticCandidate:
-    """Represents a semantic candidate stored in the database."""
+class StoredSymbolCandidate:
+    """Small symbol record used while ranking fuzzy matches."""
 
-    chunk: Chunk
-    vector: list[float]
+    id: uuid.UUID
+    name: str
+    qualified_name: str
+    relative_path: str
+    start_line: int
+
+
+@dataclass(frozen=True)
+class StoredSemanticCandidate:
+    """Chunk metadata retained in the in-memory semantic search index."""
+
+    chunk_id: uuid.UUID
+    relative_path: str
+    start_line: int
+    end_line: int
     qualified_symbol_name: str | None = None
+
+
+@dataclass(frozen=True)
+class StoredSemanticCandidateRow:
+    """One streamed semantic candidate and its serialized vector."""
+
+    candidate: StoredSemanticCandidate
+    vector_blob: bytes
+
+
+@dataclass(frozen=True)
+class SemanticCandidateSummary:
+    """Size and shape information used before allocating a search matrix."""
+
+    count: int
+    vector_bytes: int
+    dimension: int | None
 
 
 class SQLiteIndexStore:
@@ -81,14 +127,38 @@ class SQLiteIndexStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
 
-    def connect(self) -> sqlite3.Connection:
-        """Open a configured SQLite connection, creating parent dirs."""
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a writable SQLite connection, creating its parent directory."""
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.db_path)
+        self._configure_connection(connection)
+
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
+    def read_connection(self) -> Iterator[sqlite3.Connection]:
+        """Open an existing SQLite database without creating or modifying it."""
+
+        database_uri = f"{self.db_path.expanduser().resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(database_uri, uri=True)
+        self._configure_connection(connection)
+        connection.execute("PRAGMA query_only = ON")
+
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _configure_connection(connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        return connection
 
     def initialize(self) -> None:
         """Create the schema and indexes if they do not already exist."""
@@ -101,6 +171,7 @@ class SQLiteIndexStore:
                     absolute_path TEXT NOT NULL,
                     index_format_version TEXT NOT NULL,
                     timestamp_of_index INTEGER NOT NULL,
+                    embedding_provider TEXT NOT NULL DEFAULT 'unknown',
                     embedding_model TEXT NOT NULL,
                     embedding_dim INTEGER NOT NULL
                 );
@@ -179,6 +250,53 @@ class SQLiteIndexStore:
                 CREATE INDEX IF NOT EXISTS idx_embeddings_repo_model
                     ON embeddings(repository_id, model);
                 """
+            )
+            repository_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(repositories)")
+            }
+            if "embedding_provider" not in repository_columns:
+                connection.execute(
+                    "ALTER TABLE repositories "
+                    "ADD COLUMN embedding_provider TEXT NOT NULL DEFAULT 'unknown'"
+                )
+
+    def backup_to(self, destination: str | Path) -> None:
+        """Create a consistent SQLite snapshot at ``destination``."""
+
+        destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with self.read_connection() as source_connection:
+            destination_connection = sqlite3.connect(destination_path)
+            try:
+                source_connection.backup(destination_connection)
+            finally:
+                destination_connection.close()
+
+    def delete_repositories_by_path(self, absolute_path: str) -> None:
+        """Delete all stored index versions for one canonical repository path."""
+
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM repositories WHERE absolute_path = ?",
+                (absolute_path,),
+            )
+
+    def delete_other_repositories_by_path(
+        self,
+        absolute_path: str,
+        repository_id_to_keep: uuid.UUID,
+    ) -> None:
+        """Delete incompatible index versions while preserving a staged one."""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM repositories
+                WHERE absolute_path = ? AND id != ?
+                """,
+                (absolute_path, str(repository_id_to_keep)),
             )
 
     def replace_index(
@@ -270,7 +388,7 @@ class SQLiteIndexStore:
         if table not in allowed_tables:
             raise ValueError(f"Unsupported table: {table}")
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
             row = connection.execute(
                 f"SELECT COUNT(*) AS count FROM {table} WHERE repository_id = ?",
                 (str(repository_id),),
@@ -282,24 +400,29 @@ class SQLiteIndexStore:
         self,
         absolute_path: str,
         index_format_version: str,
+        embedding_provider: str,
         embedding_model: str,
         embedding_dim: int,
     ) -> Repository | None:
         """Load the compatible repository row for a local path, if present."""
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
+            provider_select = _embedding_provider_expression(connection, select=True)
+            provider_match = _embedding_provider_expression(connection)
             row = connection.execute(
-                """
+                f"""
                 SELECT
                     id,
                     absolute_path,
                     index_format_version,
                     timestamp_of_index,
+                    {provider_select},
                     embedding_model,
                     embedding_dim
                 FROM repositories
                 WHERE absolute_path = ?
                     AND index_format_version = ?
+                    AND {provider_match} = ?
                     AND embedding_model = ?
                     AND embedding_dim = ?
                 ORDER BY timestamp_of_index DESC
@@ -308,6 +431,7 @@ class SQLiteIndexStore:
                 (
                     absolute_path,
                     index_format_version,
+                    embedding_provider,
                     embedding_model,
                     embedding_dim,
                 ),
@@ -321,14 +445,19 @@ class SQLiteIndexStore:
     def load_repository(self, repository_id: uuid.UUID) -> Repository | None:
         """Load repository metadata by ID."""
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
+            provider_expression = _embedding_provider_expression(
+                connection,
+                select=True,
+            )
             row = connection.execute(
-                """
+                f"""
                 SELECT
                     id,
                     absolute_path,
                     index_format_version,
                     timestamp_of_index,
+                    {provider_expression},
                     embedding_model,
                     embedding_dim
                 FROM repositories
@@ -342,9 +471,91 @@ class SQLiteIndexStore:
 
         return _repository_from_row(row)
 
+    def load_latest_repository(
+        self,
+        absolute_path: str,
+        index_format_version: str | None = None,
+    ) -> Repository | None:
+        """Load the newest repository row without initializing an embedder."""
+
+        parameters: list[str] = [absolute_path]
+        version_clause = ""
+        if index_format_version is not None:
+            version_clause = "AND index_format_version = ?"
+            parameters.append(index_format_version)
+
+        with self.read_connection() as connection:
+            provider_expression = _embedding_provider_expression(
+                connection,
+                select=True,
+            )
+            row = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    absolute_path,
+                    index_format_version,
+                    timestamp_of_index,
+                    {provider_expression},
+                    embedding_model,
+                    embedding_dim
+                FROM repositories
+                WHERE absolute_path = ?
+                    {version_clause}
+                ORDER BY timestamp_of_index DESC, id DESC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return _repository_from_row(row)
+
+    def list_repositories(
+        self,
+        index_format_version: str | None = None,
+    ) -> list[Repository]:
+        """List repository metadata without filtering by embedding settings."""
+
+        if not self.db_path.exists():
+            return []
+
+        parameters: list[str] = []
+        version_clause = ""
+        if index_format_version is not None:
+            version_clause = "WHERE index_format_version = ?"
+            parameters.append(index_format_version)
+
+        with self.read_connection() as connection:
+            provider_expression = _embedding_provider_expression(
+                connection,
+                select=True,
+            )
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    absolute_path,
+                    index_format_version,
+                    timestamp_of_index,
+                    {provider_expression},
+                    embedding_model,
+                    embedding_dim
+                FROM repositories
+                {version_clause}
+                ORDER BY absolute_path, timestamp_of_index DESC, id DESC
+                """,
+                parameters,
+            ).fetchall()
+
+        return [_repository_from_row(row) for row in rows]
+
     def list_compatible_repositories(
         self,
         index_format_version: str,
+        embedding_provider: str,
         embedding_model: str,
         embedding_dim: int,
     ) -> list[Repository]:
@@ -353,23 +564,32 @@ class SQLiteIndexStore:
         if not self.db_path.exists():
             return []
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
+            provider_select = _embedding_provider_expression(connection, select=True)
+            provider_match = _embedding_provider_expression(connection)
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     id,
                     absolute_path,
                     index_format_version,
                     timestamp_of_index,
+                    {provider_select},
                     embedding_model,
                     embedding_dim
                 FROM repositories
                 WHERE index_format_version = ?
+                    AND {provider_match} = ?
                     AND embedding_model = ?
                     AND embedding_dim = ?
                 ORDER BY absolute_path, timestamp_of_index DESC
                 """,
-                (index_format_version, embedding_model, embedding_dim),
+                (
+                    index_format_version,
+                    embedding_provider,
+                    embedding_model,
+                    embedding_dim,
+                ),
             ).fetchall()
 
         return [_repository_from_row(row) for row in rows]
@@ -377,7 +597,7 @@ class SQLiteIndexStore:
     def load_files(self, repository_id: uuid.UUID) -> dict[str, IndexedFile]:
         """Load file metadata keyed by repository-relative path."""
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
             rows = connection.execute(
                 """
                 SELECT
@@ -409,17 +629,28 @@ class SQLiteIndexStore:
         query: str,
         path_filter: str | None = None,
         limit: int = 10,
+        max_snippet_chars: int = 4_000,
     ) -> list[Symbol]:
         """Load exact symbol matches in deterministic ranking order."""
+
+        if limit < 1:
+            raise ValueError("limit must be greater than 0")
+        if max_snippet_chars < 1:
+            raise ValueError("max_snippet_chars must be greater than 0")
 
         qualified_matches = self._load_symbols_by_column(
             repository_id=repository_id,
             column="qualified_name",
             value=query,
             path_filter=path_filter,
+            limit=limit,
+            max_snippet_chars=max_snippet_chars,
         )
 
         matches = list(qualified_matches)
+        if len(matches) >= limit:
+            return matches
+
         seen_ids = {symbol.id for symbol in matches}
 
         short_name_matches = self._load_symbols_by_column(
@@ -427,6 +658,11 @@ class SQLiteIndexStore:
             column="name",
             value=query,
             path_filter=path_filter,
+            # Fetch at most one result page. Some short-name matches can be
+            # duplicates of qualified-name matches, so using ``limit`` rather
+            # than only the remaining count still lets the page fill.
+            limit=limit,
+            max_snippet_chars=max_snippet_chars,
         )
 
         for symbol in short_name_matches:
@@ -436,6 +672,119 @@ class SQLiteIndexStore:
 
         return matches[:limit]
 
+    def load_symbol_candidates(
+        self,
+        repository_id: uuid.UUID,
+        path_filter: str | None = None,
+        *,
+        limit: int,
+        candidate_char_limit: int,
+    ) -> list[StoredSymbolCandidate]:
+        """Load bounded, snippet-free symbol metadata for fuzzy ranking.
+
+        An error is preferable to silently ranking only an arbitrary prefix of
+        a repository. Callers can ask the user to narrow the path or use a
+        retrieval mode designed for larger candidate sets.
+        """
+
+        if limit < 1:
+            raise ValueError("limit must be greater than 0")
+        if candidate_char_limit < 1:
+            raise ValueError("candidate_char_limit must be greater than 0")
+
+        parameters: list[str | int] = [
+            candidate_char_limit,
+            candidate_char_limit,
+            str(repository_id),
+        ]
+        path_clause = ""
+        if path_filter is not None:
+            path_clause, path_parameters = _path_filter_clause(
+                "relative_path",
+                path_filter,
+            )
+            parameters.extend(path_parameters)
+        parameters.append(limit + 1)
+
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    CASE WHEN length(name) <= ? THEN name ELSE '' END AS name,
+                    CASE
+                        WHEN length(qualified_name) <= ? THEN qualified_name
+                        ELSE ''
+                    END AS qualified_name,
+                    relative_path,
+                    start_line
+                FROM symbols
+                WHERE repository_id = ?
+                    {path_clause}
+                ORDER BY relative_path, qualified_name, start_line, id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+
+        if len(rows) > limit:
+            raise SearchCandidateLimitError(
+                "Fuzzy search candidate limit was exceeded; narrow the path "
+                "filter or use semantic search"
+            )
+
+        return [
+            StoredSymbolCandidate(
+                id=uuid.UUID(row["id"]),
+                name=row["name"],
+                qualified_name=row["qualified_name"],
+                relative_path=row["relative_path"],
+                start_line=row["start_line"],
+            )
+            for row in rows
+        ]
+
+    def load_symbols_by_ids(
+        self,
+        symbol_ids: Iterable[uuid.UUID],
+        *,
+        max_snippet_chars: int,
+    ) -> dict[uuid.UUID, Symbol]:
+        """Load complete symbol records for a small ranked result set."""
+
+        if max_snippet_chars < 1:
+            raise ValueError("max_snippet_chars must be greater than 0")
+
+        unique_ids = list(dict.fromkeys(symbol_ids))
+        if not unique_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    repository_id,
+                    name,
+                    qualified_name,
+                    kind,
+                    relative_path,
+                    start_line,
+                    end_line,
+                    substr(source_snippet, 1, ?) AS source_snippet
+                FROM symbols
+                WHERE id IN ({placeholders})
+                """,
+                [
+                    max_snippet_chars + 1,
+                    *(str(symbol_id) for symbol_id in unique_ids),
+                ],
+            ).fetchall()
+
+        symbols = [_symbol_from_row(row) for row in rows]
+        return {symbol.id: symbol for symbol in symbols}
+
     def load_all_symbols(
         self, repository_id: uuid.UUID, path_filter: str | None = None
     ) -> list[Symbol]:
@@ -443,10 +792,13 @@ class SQLiteIndexStore:
         parameters: list[str] = [str(repository_id)]
         path_clause = ""
         if path_filter is not None:
-            path_clause = "AND relative_path = ?"
-            parameters.append(path_filter)
+            path_clause, path_parameters = _path_filter_clause(
+                "relative_path",
+                path_filter,
+            )
+            parameters.extend(path_parameters)
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT
@@ -469,29 +821,96 @@ class SQLiteIndexStore:
 
         return [_symbol_from_row(row) for row in rows]
 
-    def load_semantic_candidates(
-        self, repository_id: uuid.UUID, path_filter: str | None = None
-    ) -> list[StoredSemanticCandidate]:
+    def semantic_candidate_summary(
+        self,
+        repository_id: uuid.UUID,
+        path_filter: str | None = None,
+        *,
+        max_candidates: int,
+        max_vector_bytes: int,
+        cancellation_check: Callable[[], None] | None = None,
+    ) -> SemanticCandidateSummary:
+        """Return semantic candidate bounds without loading their contents."""
+
+        if max_candidates < 1:
+            raise ValueError("max_candidates must be greater than 0")
+        if max_vector_bytes < 1:
+            raise ValueError("max_vector_bytes must be greater than 0")
+
         parameters: list[str] = [str(repository_id)]
         path_clause = ""
         if path_filter is not None:
-            path_clause = "AND chunks.relative_path = ?"
-            parameters.append(path_filter)
+            path_clause, path_parameters = _path_filter_clause(
+                "chunks.relative_path",
+                path_filter,
+            )
+            parameters.extend(path_parameters)
 
-        with self.connect() as connection:
+        parameters.append(max_candidates + 1)
+
+        candidate_count = 0
+        vector_bytes = 0
+        dimensions: set[int] = set()
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    embeddings.dimension,
+                    length(embeddings.vector) AS vector_bytes
+                FROM chunks
+                INNER JOIN embeddings
+                    ON embeddings.chunk_id = chunks.id
+                WHERE chunks.repository_id = ?
+                    {path_clause}
+                LIMIT ?
+                """,
+                parameters,
+            )
+            for row in rows:
+                if cancellation_check is not None:
+                    cancellation_check()
+                candidate_count += 1
+                vector_bytes += int(row["vector_bytes"])
+                dimensions.add(int(row["dimension"]))
+                if vector_bytes > max_vector_bytes:
+                    break
+
+        if len(dimensions) > 1:
+            raise ValueError("Stored embeddings have inconsistent dimensions")
+
+        return SemanticCandidateSummary(
+            count=candidate_count,
+            vector_bytes=vector_bytes,
+            dimension=next(iter(dimensions), None),
+        )
+
+    def iter_semantic_candidate_rows(
+        self,
+        repository_id: uuid.UUID,
+        path_filter: str | None = None,
+    ) -> Iterator[StoredSemanticCandidateRow]:
+        """Stream semantic metadata and vectors without retaining SQL rows."""
+
+        parameters: list[str] = [str(repository_id)]
+        path_clause = ""
+        if path_filter is not None:
+            path_clause, path_parameters = _path_filter_clause(
+                "chunks.relative_path",
+                path_filter,
+            )
+            parameters.extend(path_parameters)
+
+        with self.read_connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT
                     chunks.id,
-                    chunks.repository_id,
                     chunks.relative_path,
                     chunks.start_line,
                     chunks.end_line,
-                    chunks.symbol_id,
-                    chunks.raw_text,
-                    chunks.content_hash,
                     embeddings.vector AS embedding_vector,
-                    symbols.qualified_name AS qualified_symbol_name
+                    substr(symbols.qualified_name, 1, 4096)
+                        AS qualified_symbol_name
                 FROM chunks
                 INNER JOIN embeddings
                     ON embeddings.chunk_id = chunks.id
@@ -506,30 +925,46 @@ class SQLiteIndexStore:
                     chunks.id
                 """,
                 parameters,
+            )
+            for row in rows:
+                yield StoredSemanticCandidateRow(
+                    candidate=StoredSemanticCandidate(
+                        chunk_id=uuid.UUID(row["id"]),
+                        relative_path=row["relative_path"],
+                        start_line=row["start_line"],
+                        end_line=row["end_line"],
+                        qualified_symbol_name=row["qualified_symbol_name"],
+                    ),
+                    vector_blob=row["embedding_vector"],
+                )
+
+    def load_chunk_texts(
+        self,
+        chunk_ids: Iterable[uuid.UUID],
+        *,
+        max_chars: int,
+    ) -> dict[uuid.UUID, str]:
+        """Load source text only for chunks selected by semantic ranking."""
+
+        if max_chars < 1:
+            raise ValueError("max_chars must be greater than 0")
+
+        unique_ids = list(dict.fromkeys(chunk_ids))
+        if not unique_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, substr(raw_text, 1, ?) AS raw_text
+                FROM chunks
+                WHERE id IN ({placeholders})
+                """,
+                [max_chars + 1, *(str(chunk_id) for chunk_id in unique_ids)],
             ).fetchall()
 
-            candidates = []
-            for row in rows:
-                chunk = Chunk(
-                    id=uuid.UUID(row["id"]),
-                    repository_id=uuid.UUID(row["repository_id"]),
-                    relative_path=row["relative_path"],
-                    start_line=row["start_line"],
-                    end_line=row["end_line"],
-                    symbol_id=uuid.UUID(row["symbol_id"]) if row["symbol_id"] else None,
-                    raw_text=row["raw_text"],
-                    content_hash=row["content_hash"],
-                )
-
-                candidates.append(
-                    StoredSemanticCandidate(
-                        chunk=chunk,
-                        vector=unpack_vector(row["embedding_vector"]),
-                        qualified_symbol_name=row["qualified_symbol_name"],
-                    )
-                )
-
-            return candidates
+        return {uuid.UUID(row["id"]): row["raw_text"] for row in rows}
 
     def _load_symbols_by_column(
         self,
@@ -537,6 +972,8 @@ class SQLiteIndexStore:
         column: str,
         value: str,
         path_filter: str | None = None,
+        limit: int = 10,
+        max_snippet_chars: int = 4_000,
     ) -> list[Symbol]:
         """Load symbols where an allowed text column exactly matches a value."""
 
@@ -544,13 +981,26 @@ class SQLiteIndexStore:
         if column not in allowed_columns:
             raise ValueError(f"Unsupported symbol lookup column: {column}")
 
-        parameters: list[str] = [str(repository_id), value]
+        if limit < 1:
+            raise ValueError("limit must be greater than 0")
+        if max_snippet_chars < 1:
+            raise ValueError("max_snippet_chars must be greater than 0")
+
+        parameters: list[str | int] = [
+            max_snippet_chars + 1,
+            str(repository_id),
+            value,
+        ]
         path_clause = ""
         if path_filter is not None:
-            path_clause = "AND relative_path = ?"
-            parameters.append(path_filter)
+            path_clause, path_parameters = _path_filter_clause(
+                "relative_path",
+                path_filter,
+            )
+            parameters.extend(path_parameters)
+        parameters.append(limit)
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT
@@ -562,42 +1012,55 @@ class SQLiteIndexStore:
                     relative_path,
                     start_line,
                     end_line,
-                    source_snippet
+                    substr(source_snippet, 1, ?) AS source_snippet
                 FROM symbols
                 WHERE repository_id = ?
                     AND {column} = ?
                     {path_clause}
                 ORDER BY relative_path, qualified_name, start_line
+                LIMIT ?
                 """,
                 parameters,
             ).fetchall()
 
         return [_symbol_from_row(row) for row in rows]
 
-    def load_embeddings_by_content_hash(
+    def load_embeddings_by_content_hashes(
         self,
         repository_id: uuid.UUID,
         model: str,
         dimension: int,
+        content_hashes: Iterable[str],
     ) -> dict[str, list[float]]:
-        """Load reusable embeddings keyed by chunk content hash."""
+        """Load reusable embeddings only for a bounded set of chunk hashes."""
 
-        with self.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT chunks.content_hash, embeddings.vector
-                FROM embeddings
-                INNER JOIN chunks ON chunks.id = embeddings.chunk_id
-                WHERE embeddings.repository_id = ?
-                    AND embeddings.model = ?
-                    AND embeddings.dimension = ?
-                """,
-                (str(repository_id), model, dimension),
-            ).fetchall()
+        unique_hashes = list(dict.fromkeys(content_hashes))
+        if not unique_hashes:
+            return {}
 
         reusable: dict[str, list[float]] = {}
-        for row in rows:
-            reusable.setdefault(row["content_hash"], unpack_vector(row["vector"]))
+        with self.read_connection() as connection:
+            # Stay below SQLite's platform-dependent bound-variable limit.
+            for offset in range(0, len(unique_hashes), 500):
+                hash_batch = unique_hashes[offset : offset + 500]
+                placeholders = ", ".join("?" for _ in hash_batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT chunks.content_hash, embeddings.vector
+                    FROM embeddings
+                    INNER JOIN chunks ON chunks.id = embeddings.chunk_id
+                    WHERE embeddings.repository_id = ?
+                        AND embeddings.model = ?
+                        AND embeddings.dimension = ?
+                        AND chunks.content_hash IN ({placeholders})
+                    """,
+                    [str(repository_id), model, dimension, *hash_batch],
+                )
+                for row in rows:
+                    reusable.setdefault(
+                        row["content_hash"],
+                        unpack_vector(row["vector"]),
+                    )
 
         return reusable
 
@@ -607,7 +1070,7 @@ class SQLiteIndexStore:
     ) -> list[tuple[uuid.UUID, list[float]]]:
         """Load all stored embeddings for a repository."""
 
-        with self.connect() as connection:
+        with self.read_connection() as connection:
             rows = connection.execute(
                 """
                 SELECT chunk_id, vector
@@ -634,14 +1097,16 @@ class SQLiteIndexStore:
                 absolute_path,
                 index_format_version,
                 timestamp_of_index,
+                embedding_provider,
                 embedding_model,
                 embedding_dim
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 absolute_path = excluded.absolute_path,
                 index_format_version = excluded.index_format_version,
                 timestamp_of_index = excluded.timestamp_of_index,
+                embedding_provider = excluded.embedding_provider,
                 embedding_model = excluded.embedding_model,
                 embedding_dim = excluded.embedding_dim
             """,
@@ -650,6 +1115,7 @@ class SQLiteIndexStore:
                 repository.absolute_path,
                 repository.index_format_version,
                 repository.timestamp_of_index,
+                repository.embedding_provider,
                 repository.embedding_model,
                 repository.embedding_dim,
             ),
@@ -821,9 +1287,41 @@ def _repository_from_row(row: sqlite3.Row) -> Repository:
         absolute_path=row["absolute_path"],
         index_format_version=row["index_format_version"],
         timestamp_of_index=row["timestamp_of_index"],
+        embedding_provider=row["embedding_provider"],
         embedding_model=row["embedding_model"],
         embedding_dim=row["embedding_dim"],
     )
+
+
+def _embedding_provider_expression(
+    connection: sqlite3.Connection,
+    *,
+    select: bool = False,
+) -> str:
+    """Select a stored provider or a legacy-compatible unknown value."""
+
+    repository_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(repositories)")
+    }
+    if "embedding_provider" in repository_columns:
+        return "embedding_provider"
+    if select:
+        return "'unknown' AS embedding_provider"
+    return "'unknown'"
+
+
+def _path_filter_clause(column: str, path_filter: str) -> tuple[str, list[str]]:
+    """Return a safe SQL clause for one file or directory-prefix filter."""
+
+    allowed_columns = {"relative_path", "chunks.relative_path"}
+    if column not in allowed_columns:
+        raise ValueError(f"Unsupported path filter column: {column}")
+
+    escaped_prefix = (
+        path_filter.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    clause = f"AND ({column} = ? OR {column} LIKE ? ESCAPE '\\')"
+    return clause, [path_filter, f"{escaped_prefix}/%"]
 
 
 def _symbol_from_row(row: sqlite3.Row) -> Symbol:
