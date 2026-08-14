@@ -7,9 +7,9 @@ concept.
 """
 
 import uuid
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 SymbolKind = Literal[
     # A regular function declared outside a class.
@@ -24,7 +24,22 @@ SymbolKind = Literal[
     "async_method",
 ]
 
+# ``RetrievalKind`` is the mode that actually produced a result. ``auto`` is
+# only a caller preference, so it belongs to ``RetrievalMode`` instead.
 RetrievalKind = Literal["exact", "fuzzy", "semantic"]
+RetrievalMode = Literal["exact", "fuzzy", "semantic", "auto"]
+BackendKind = Literal["python", "mojo"]
+BackendPreference = Literal["auto", "python", "mojo"]
+IndexStatus = Literal["missing", "ready", "stale", "indexing"]
+
+TopK = Annotated[int, Field(ge=1, le=20)]
+SnippetCharacterLimit = Annotated[int, Field(ge=1, le=4_000)]
+QueryText = Annotated[str, Field(min_length=1, max_length=2_000)]
+BoundedPathSamples = Annotated[list[str], Field(max_length=20)]
+BoundedIndexingErrors = Annotated[
+    list["IndexingErrorResponse"],
+    Field(max_length=20),
+]
 
 
 class Repository(BaseModel):
@@ -38,6 +53,8 @@ class Repository(BaseModel):
     index_format_version: str
     # UTC Unix timestamp representing when this index was created or refreshed.
     timestamp_of_index: int
+    # Stable implementation name used to produce embedding vectors.
+    embedding_provider: str
     # Name of the embedding model used to create vectors for this index.
     embedding_model: str
     # Number of floating-point values in every vector from the embedding model.
@@ -94,15 +111,26 @@ class SearchRequest(BaseModel):
     """Validated input supplied to the future unified search service."""
 
     # User text, symbol name, typo, or natural-language description to retrieve.
-    query: str
+    query: QueryText
     # Explicit retrieval strategy selected by the caller.
-    request_mode: RetrievalKind
+    request_mode: RetrievalMode = "auto"
     # Maximum number of ranked results the caller wants returned.
-    top_k: int
+    top_k: TopK = 5
     # Optional repository-relative path used to narrow the search space.
-    path: str | None = None
+    path: Annotated[str, Field(max_length=4_096)] | None = None
     # Compute implementation requested for supported hot loops.
-    backend: Literal["python", "mojo"]
+    backend: BackendPreference = "auto"
+    # Maximum source characters included in each returned result.
+    max_snippet_chars: SnippetCharacterLimit = 2_000
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, query: str) -> str:
+        """Reject queries that contain no non-whitespace characters."""
+
+        if query.strip() == "":
+            raise ValueError("query must not be empty")
+        return query
 
 
 class SearchResult(BaseModel):
@@ -113,34 +141,99 @@ class SearchResult(BaseModel):
     # Indicates which record type should be loaded or interpreted.
     result_type: Literal["symbol", "chunk"]
     # Repository-relative source file containing the match.
-    file_path: str
+    file_path: Annotated[str, Field(max_length=4_096)]
     # Inclusive one-based source range displayed to the caller.
     start_line: int
     end_line: int
     # Available for symbol-owned results; absent for module-level chunks.
-    symbol_name: str | None = None
+    symbol_name: Annotated[str, Field(max_length=4_096)] | None = None
+    # Source language used by renderers and coding agents.
+    language: str = "python"
     # Bounded source text included with the result.
-    snippet: str
+    snippet: Annotated[str, Field(max_length=4_000)]
+    # True when the source text was shortened to satisfy an output limit.
+    snippet_truncated: bool = False
     # Mode-specific relevance normalized into a comparable output range.
-    score: float
+    score: float = Field(ge=0.0, le=1.0)
     # Retrieval strategy that produced this result.
     mode: RetrievalKind
     # Compute implementation that actually performed the relevant operation.
-    backend: Literal["python", "mojo"]
+    backend: BackendKind
 
 
 class SearchResponse(BaseModel):
     """Complete structured response returned by CLI, Streamlit, or MCP."""
 
     # Preserve caller input for logging and structured tool responses.
-    original_query: str
-    # Mode actually used; future auto-routing may differ from requested mode.
+    original_query: QueryText
+    # Caller preference and the mode selected by the router.
+    requested_mode: RetrievalMode = "auto"
     mode: RetrievalKind
-    # Backend actually used after availability checks and fallback.
-    backend: Literal["python", "mojo"]
+    # Caller preference and backend actually used after availability checks.
+    requested_backend: BackendPreference = "auto"
+    backend: BackendKind
     # End-to-end retrieval duration measured in seconds.
     elapsed_time: float
     # Ordered best-first results.
-    ranked_results: list[SearchResult]
+    ranked_results: list[SearchResult] = Field(max_length=20)
     # Non-fatal details such as falling back from Mojo to Python.
-    warnings: list[str]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class IndexingErrorResponse(BaseModel):
+    """One bounded, structured error reported by an indexing operation."""
+
+    relative_path: str
+    stage: str
+    message: str
+
+
+class IndexRepositoryResponse(BaseModel):
+    """Structured result returned after an explicit repository index run."""
+
+    repository_path: str
+    database_path: str
+    status: Literal["ready", "stale"]
+    index_format_version: str
+    timestamp_of_index: int
+    embedding_provider: str
+    embedding_model: str
+    embedding_dim: int = Field(ge=1)
+    file_count: int = Field(default=0, ge=0)
+    symbol_count: int = Field(default=0, ge=0)
+    chunk_count: int = Field(default=0, ge=0)
+    embedding_count: int = Field(default=0, ge=0)
+    added_file_count: int = Field(default=0, ge=0)
+    changed_file_count: int = Field(default=0, ge=0)
+    deleted_file_count: int = Field(default=0, ge=0)
+    embedded_chunk_count: int = Field(default=0, ge=0)
+    reused_embedding_count: int = Field(default=0, ge=0)
+    elapsed_time: float = Field(default=0.0, ge=0.0)
+    changed_paths: BoundedPathSamples = Field(default_factory=list)
+    error_count: int = Field(default=0, ge=0)
+    errors: BoundedIndexingErrors = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class IndexStatusResponse(BaseModel):
+    """Current index presence and freshness for one repository."""
+
+    repository_path: str
+    database_path: str
+    status: IndexStatus
+    index_format_version: str | None = None
+    timestamp_of_index: int | None = None
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    embedding_dim: int | None = Field(default=None, ge=1)
+    file_count: int = Field(default=0, ge=0)
+    symbol_count: int = Field(default=0, ge=0)
+    chunk_count: int = Field(default=0, ge=0)
+    embedding_count: int = Field(default=0, ge=0)
+    added_file_count: int = Field(default=0, ge=0)
+    changed_file_count: int = Field(default=0, ge=0)
+    deleted_file_count: int = Field(default=0, ge=0)
+    changed_paths: BoundedPathSamples = Field(default_factory=list)
+    error_count: int = Field(default=0, ge=0)
+    errors: BoundedIndexingErrors = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)

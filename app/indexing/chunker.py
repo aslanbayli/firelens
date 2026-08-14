@@ -106,8 +106,13 @@ def chunk_symbols(
     max_lines: int = 100,
     # Overlap preserves context where a long function is split.
     overlap: int = 20,
+    # Bound vectors and embedding inputs produced by one adversarial file.
+    max_chunks: int = 2_048,
 ) -> list[Chunk]:
     """Create one or more semantic-search chunks for each symbol."""
+
+    if max_chunks < 1:
+        raise ValueError("max_chunks must be positive")
 
     # Keep line endings so joining slices reconstructs exact source formatting.
     source_lines = source.splitlines(keepends=True)
@@ -125,6 +130,10 @@ def chunk_symbols(
             max_lines,
             overlap,
         ):
+            if len(chunks) >= max_chunks:
+                raise ValueError(
+                    f"File exceeds the {max_chunks} semantic chunk limit"
+                )
             # Translate one-based inclusive source lines into a zero-based
             # Python slice with an exclusive end.
             raw_text = "".join(source_lines[start_line - 1 : end_line])

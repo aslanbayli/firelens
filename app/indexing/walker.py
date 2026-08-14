@@ -6,8 +6,13 @@ generate embeddings. Keeping those stages separate makes each behavior easier
 to test and lets the indexer report exactly which stage failed.
 """
 
+import os
+import stat
 from fnmatch import fnmatch
 from pathlib import Path
+
+from app.core.cancellation import CancellationCallback, raise_if_cancelled
+from app.indexing.file_io import read_regular_file
 
 DEFAULT_IGNORED_NAMES = {
     ".git",
@@ -15,11 +20,15 @@ DEFAULT_IGNORED_NAMES = {
     "venv",
     "node_modules",
     "__pycache__",
+    "build",
+    "dist",
 }
+ROOT_IGNORED_NAMES = {"data"}
 
 # FireLens currently parses only Python using the standard-library AST. Files
 # from other languages must be excluded until an appropriate parser exists.
 SUPPORTED_SUFFIXES = {".py"}
+MAX_GITIGNORE_RULES = 512
 
 
 def is_binary(path: Path, sample_size: int = 8192) -> bool:
@@ -30,9 +39,7 @@ def is_binary(path: Path, sample_size: int = 8192) -> bool:
     Reading only a sample prevents scanning an entire large file twice.
     """
 
-    with path.open("rb") as file:
-        # Read at most `sample_size` bytes so the check has bounded cost.
-        sample = file.read(sample_size)
+    _, sample = read_regular_file(path, byte_limit=sample_size)
 
     return b"\x00" in sample
 
@@ -84,16 +91,36 @@ class GitIgnoreRule:
         return any(fnmatch(part, self.pattern) for part in relative_path.parts)
 
 
-def load_gitignore_rules(root: Path) -> list[GitIgnoreRule]:
+def load_gitignore_rules(
+    root: Path,
+    max_size: int = 1_000_000,
+    cancellation_callback: CancellationCallback | None = None,
+    max_rules: int = MAX_GITIGNORE_RULES,
+) -> list[GitIgnoreRule]:
     """Parse root .gitignore into simple matching rules."""
 
+    if max_rules < 1:
+        raise ValueError("max_rules must be greater than 0")
+    raise_if_cancelled(cancellation_callback)
     gitignore_path = root / ".gitignore"
-    if not gitignore_path.exists():
+    try:
+        gitignore_status = os.lstat(gitignore_path)
+    except FileNotFoundError:
         return []
+    if _is_link_or_reparse_point(gitignore_status):
+        return []
+    _, gitignore_bytes = read_regular_file(
+        gitignore_path,
+        byte_limit=max_size + 1,
+    )
+    if len(gitignore_bytes) > max_size:
+        raise ValueError(f".gitignore exceeds the {max_size} byte limit")
+    raise_if_cancelled(cancellation_callback)
 
     rules: list[GitIgnoreRule] = []
 
-    for line in gitignore_path.read_text(encoding="utf-8").splitlines():
+    for line in gitignore_bytes.decode("utf-8").splitlines():
+        raise_if_cancelled(cancellation_callback)
         stripped_line = line.strip()
         if not stripped_line or stripped_line.startswith("#"):
             continue
@@ -116,6 +143,8 @@ def load_gitignore_rules(root: Path) -> list[GitIgnoreRule]:
         if not stripped_line:
             continue
 
+        if len(rules) >= max_rules:
+            raise ValueError(f".gitignore exceeds the {max_rules} rule limit")
         rules.append(
             GitIgnoreRule(
                 pattern=stripped_line,
@@ -132,12 +161,14 @@ def is_gitignored(
     relative_path: Path,
     is_directory: bool,
     rules: list[GitIgnoreRule],
+    cancellation_callback: CancellationCallback | None = None,
 ) -> bool:
     """Return True when .gitignore rules exclude a path."""
 
     ignored = False
 
     for rule in rules:
+        raise_if_cancelled(cancellation_callback)
         if rule.matches(relative_path, is_directory):
             ignored = not rule.negated
 
@@ -152,12 +183,16 @@ def walk(
     max_file_size: int = 1_000_000,
     # Abort unusually large traversals instead of consuming unbounded resources.
     max_files: int = 10_000,
+    # Bound all visited directory entries, including ignored and unsupported files.
+    max_entries: int = 100_000,
+    cancellation_callback: CancellationCallback | None = None,
 ) -> list[Path]:
     """Return deterministic source-file paths relative to a repository root."""
 
     # Convert strings to Path objects, expand "~", resolve "..", and create a
     # canonical absolute root. Canonicalization is important for safe relative
     # paths and consistent repository identity.
+    raise_if_cancelled(cancellation_callback)
     root = Path(path).expanduser().resolve()
 
     if not root.exists():
@@ -172,42 +207,125 @@ def walk(
     if ignore_rules is not None:
         ignored_names = ignored_names.union(ignore_rules)
 
-    gitignore_rules = load_gitignore_rules(root)
+    gitignore_rules = load_gitignore_rules(
+        root,
+        max_size=max_file_size,
+        cancellation_callback=cancellation_callback,
+    )
     paths: list[Path] = []
+    visited_entries = 0
+    pending_directories = [root]
 
-    # `rglob("*")` recursively yields every descendant beneath the root. The
-    # following guards progressively reject entries that are not indexable.
-    for candidate in root.rglob("*"):
-        relative_path = candidate.relative_to(root)
+    while pending_directories:
+        raise_if_cancelled(cancellation_callback)
+        current_path = pending_directories.pop()
+        child_directories: list[Path] = []
 
-        if any(part in ignored_names for part in relative_path.parts):
+        try:
+            current_status = os.lstat(current_path)
+            resolved_directory = current_path.resolve(strict=True)
+        except OSError:
+            continue
+        if _is_link_or_reparse_point(current_status):
+            continue
+        if not _is_within(resolved_directory, root):
             continue
 
-        if is_gitignored(relative_path, candidate.is_dir(), gitignore_rules):
-            continue
+        with os.scandir(current_path) as entries:
+            for entry in entries:
+                # Check and count immediately after scandir yields one entry.
+                # This keeps a huge single directory from being materialized
+                # before the configured traversal bound is enforced.
+                raise_if_cancelled(cancellation_callback)
+                visited_entries += 1
+                _validate_entry_count(visited_entries, max_entries)
 
-        # Directories cannot be parsed as source files.
-        if not candidate.is_file():
-            continue
+                candidate = current_path / entry.name
+                relative_path = candidate.relative_to(root)
+                try:
+                    entry_status = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if _is_link_or_reparse_point(entry_status):
+                    continue
+                if (
+                    relative_path.parts[0] in ROOT_IGNORED_NAMES
+                    or any(part in ignored_names for part in relative_path.parts)
+                ):
+                    continue
 
-        # currently accepts only `.py` files because only Python is parsed.
-        if candidate.suffix.lower() not in SUPPORTED_SUFFIXES:
-            continue
+                if entry.is_dir(follow_symlinks=False):
+                    if is_gitignored(
+                        relative_path,
+                        True,
+                        gitignore_rules,
+                        cancellation_callback,
+                    ):
+                        continue
+                    child_directories.append(candidate)
+                    continue
 
-        if candidate.stat().st_size > max_file_size:
-            continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if candidate.suffix.lower() not in SUPPORTED_SUFFIXES:
+                    continue
+                if is_gitignored(
+                    relative_path,
+                    False,
+                    gitignore_rules,
+                    cancellation_callback,
+                ):
+                    continue
+                if entry_status.st_size > max_file_size:
+                    continue
 
-        if is_binary(candidate):
-            continue
+                try:
+                    resolved_candidate = candidate.resolve(strict=True)
+                except OSError:
+                    continue
+                if not _is_within(resolved_candidate, root):
+                    continue
+                if is_binary(candidate):
+                    continue
+                raise_if_cancelled(cancellation_callback)
 
-        paths.append(relative_path)
+                paths.append(relative_path)
+                if len(paths) > max_files:
+                    raise ValueError(
+                        f"Repository exceeds the {max_files} file limit"
+                    )
 
-        if len(paths) > max_files:
-            raise ValueError(f"Repository exceeds the {max_files} file limit")
+        # Reverse the local sort because the stack is last-in, first-out.
+        # Retained directory names are bounded by the remaining entry budget.
+        pending_directories.extend(
+            sorted(
+                child_directories,
+                key=lambda directory: directory.name,
+                reverse=True,
+            )
+        )
 
     # TODO: Make supported suffixes and generated-file detection configurable
     # when support for languages beyond Python is added.
 
     # Filesystem traversal order is not guaranteed. Sorting by POSIX-style path
     # produces repeatable indexes and repeatable tests on every run.
+    raise_if_cancelled(cancellation_callback)
     return sorted(paths, key=lambda item: item.as_posix())
+
+
+def _validate_entry_count(entry_count: int, maximum: int) -> None:
+    if entry_count > maximum:
+        raise ValueError(f"Repository exceeds the {maximum} entry scan limit")
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _is_link_or_reparse_point(path_status: os.stat_result) -> bool:
+    if stat.S_ISLNK(path_status.st_mode):
+        return True
+    reparse_mask = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_status, "st_file_attributes", 0)
+    return bool(reparse_mask and file_attributes & reparse_mask)

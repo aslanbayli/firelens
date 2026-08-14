@@ -2,8 +2,12 @@
 __pycache__
 venv/
 .venv/
+*.egg-info/
+/build/
+/dist/
 .env
 .DS_Store
+*cache
 
 # local dev
 *.md

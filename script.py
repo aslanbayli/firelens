@@ -26,7 +26,8 @@ store = SQLiteIndexStore("data/indexes/firelens-de72b1b6d5a7/firelens.db")
 repository = store.load_repository_by_identity(
     absolute_path="/Users/aslanbayli/Documents/projects/firelens",
     index_format_version="1",
-    embedding_model="nomic-ai/CodeRankEmbed",
+    embedding_provider=CodeRankEmbedder.provider,
+    embedding_model=CodeRankEmbedder.model,
     embedding_dim=768,
 )
 if repository is None:

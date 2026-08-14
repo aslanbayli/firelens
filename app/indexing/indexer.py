@@ -6,23 +6,28 @@ AST traversal, chunk boundaries, and vector generation.
 """
 
 import hashlib
+import os
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
 
+from app.core.cancellation import CancellationCallback, OperationCancelledError
 from app.core.models import Chunk, Repository, Symbol
 from app.indexing.chunker import build_embedding_text, chunk_symbols
 from app.indexing.embedder import Embedder, validate_embeddings
+from app.indexing.file_io import read_regular_file
+from app.indexing.manifest import build_file_manifest, compare_file_manifests
 from app.indexing.parser import parse_symbols
 from app.indexing.walker import walk
 from app.storage.database import (
-    IndexedFile,
     IndexedFileRecords,
     SQLiteIndexStore,
     default_database_path,
 )
+from app.storage.locking import exclusive_database_lock
 
 
 # Frozen prevents accidental mutation after an error has been recorded.
@@ -70,6 +75,7 @@ class IndexingReport:
     embedded_chunk_count: int
     reused_embedding_count: int
     errors: list[IndexingError]
+    changed_paths: list[str]
 
 
 @dataclass(frozen=True)
@@ -85,16 +91,50 @@ class IndexingProgress:
 ProgressCallback = Callable[[IndexingProgress], None]
 
 
+class IndexingCancelledError(OperationCancelledError):
+    """Raised when a caller cooperatively cancels an indexing run."""
+
+
+def raise_if_indexing_cancelled(
+    cancellation_callback: CancellationCallback | None,
+) -> None:
+    """Stop at a safe pipeline boundary when cancellation was requested."""
+
+    if cancellation_callback is not None and cancellation_callback():
+        raise IndexingCancelledError("Repository indexing was cancelled")
+
+
+def _indexing_cancellation_adapter(
+    cancellation_callback: CancellationCallback | None,
+) -> CancellationCallback | None:
+    """Preserve the indexing-specific exception in shared cancellable helpers."""
+
+    if cancellation_callback is None:
+        return None
+
+    def check_indexing_cancellation() -> bool:
+        raise_if_indexing_cancelled(cancellation_callback)
+        return False
+
+    return check_indexing_cancellation
+
+
 def index(
     # Repository path from a CLI, UI, test, or Python caller.
     path: str | Path,
     # Any concrete object satisfying the Embedder protocol.
     embedder: Embedder,
+    max_file_size: int = 1_000_000,
+    max_files: int = 10_000,
+    max_entries: int = 100_000,
+    max_chunks_per_file: int = 2_048,
+    cancellation_callback: CancellationCallback | None = None,
 ) -> InMemoryIndex:
     """Build an in-memory index for a local Python repository."""
 
     # Convert strings to Path, expand "~", resolve "..", and produce one
     # canonical absolute root. The walker performs existence/type validation.
+    raise_if_indexing_cancelled(cancellation_callback)
     root = Path(path).expanduser().resolve()
 
     # Every symbol and chunk from this run refers to this repository identity.
@@ -102,6 +142,8 @@ def index(
 
     # Capture repository and embedding compatibility metadata before processing
     # files. A persisted index must not mix vectors from incompatible models.
+    embedding_dimension = embedder.dimension
+    raise_if_indexing_cancelled(cancellation_callback)
     repository = Repository(
         # Unique identity for this repository record.
         id=repository_id,
@@ -111,15 +153,25 @@ def index(
         index_format_version="1",
         # Store a timezone-aware current time as an integer Unix timestamp.
         timestamp_of_index=int(datetime.now(UTC).timestamp()),
+        embedding_provider=embedder.provider,
         # Read provider metadata through the generic interface.
         embedding_model=embedder.model,
         # Every vector in this index must have this exact length.
-        embedding_dim=embedder.dimension,
+        embedding_dim=embedding_dimension,
     )
 
     # Discover safe, supported files using walker defaults. Results are relative
     # and sorted, so processing order is deterministic.
-    paths = walk(root)
+    paths = walk(
+        root,
+        max_file_size=max_file_size,
+        max_files=max_files,
+        max_entries=max_entries,
+        cancellation_callback=_indexing_cancellation_adapter(
+            cancellation_callback
+        ),
+    )
+    raise_if_indexing_cancelled(cancellation_callback)
 
     # Collect all successfully parsed declarations.
     symbols: list[Symbol] = []
@@ -132,13 +184,9 @@ def index(
 
     # Run each discovered file through read → parse → chunk.
     for relative_path in paths:
-        # Reconstruct the source file location from the trusted root and the
-        # walker-produced relative path.
-        absolute_path = root / relative_path
-
+        raise_if_indexing_cancelled(cancellation_callback)
         try:
-            # Read and decode the entire Python source file as UTF-8 text.
-            source = absolute_path.read_text(encoding="utf-8")
+            source = _read_source_text(root, relative_path, max_file_size)
         except (OSError, UnicodeDecodeError) as error:
             # OSError covers filesystem failures; UnicodeDecodeError indicates
             # that the bytes could not be interpreted using UTF-8.
@@ -201,7 +249,11 @@ def index(
 
         try:
             # Split every symbol into bounded, optionally overlapping chunks.
-            file_chunks = chunk_symbols(source, file_symbols)
+            file_chunks = chunk_symbols(
+                source,
+                file_symbols,
+                max_chunks=max_chunks_per_file,
+            )
 
             # Add this file's chunks to the complete index in processing order.
             chunks.extend(file_chunks)
@@ -215,6 +267,8 @@ def index(
                 )
             )
 
+        raise_if_indexing_cancelled(cancellation_callback)
+
     # Create O(1)-average ID lookup. Scanning all symbols for every chunk would
     # grow unnecessarily expensive as repository size increases.
     symbols_by_id = {symbol.id: symbol for symbol in symbols}
@@ -226,7 +280,9 @@ def index(
     ]
 
     # Send one batch to allow real providers/models to amortize overhead.
+    raise_if_indexing_cancelled(cancellation_callback)
     embeddings = embedder.embed(embedding_texts)
+    raise_if_indexing_cancelled(cancellation_callback)
 
     # Reject missing, extra, or wrong-sized vectors before storage/search.
     validate_embeddings(
@@ -235,7 +291,7 @@ def index(
         # Provider output being verified.
         embeddings,
         # Establishes required length of every vector.
-        expected_dimension=embedder.dimension,
+        expected_dimension=embedding_dimension,
     )
 
     # Return every artifact now so each stage can be inspected and tested before
@@ -258,20 +314,176 @@ def index_to_sqlite(
     db_path: str | Path | None = None,
     # Optional UI/CLI hook. Callers can adapt this to tqdm, Streamlit, or logs.
     progress_callback: ProgressCallback | None = None,
+    max_file_size: int = 1_000_000,
+    max_files: int = 10_000,
+    max_entries: int = 100_000,
+    max_chunks_per_file: int = 2_048,
+    cancellation_callback: CancellationCallback | None = None,
 ) -> IndexingReport:
-    """Incrementally build an index and persist it to SQLite."""
+    """Incrementally build an index and atomically replace the SQLite file."""
 
+    raise_if_indexing_cancelled(cancellation_callback)
     root = Path(path).expanduser().resolve()
-    database_path = Path(db_path) if db_path is not None else default_database_path(root)
+    database_path = (
+        Path(db_path) if db_path is not None else default_database_path(root)
+    )
+    database_path = database_path.expanduser()
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def check_cancellation() -> None:
+        raise_if_indexing_cancelled(cancellation_callback)
+
+    lock_cancellation_check: Callable[[], None] | None = None
+    if cancellation_callback is not None:
+        lock_cancellation_check = check_cancellation
+
+    with exclusive_database_lock(
+        database_path,
+        cancellation_check=lock_cancellation_check,
+    ):
+        raise_if_indexing_cancelled(cancellation_callback)
+        return _index_to_sqlite_atomically(
+            root=root,
+            embedder=embedder,
+            database_path=database_path,
+            progress_callback=progress_callback,
+            max_file_size=max_file_size,
+            max_files=max_files,
+            max_entries=max_entries,
+            max_chunks_per_file=max_chunks_per_file,
+            cancellation_callback=cancellation_callback,
+        )
+
+
+def _index_to_sqlite_atomically(
+    root: Path,
+    embedder: Embedder,
+    database_path: Path,
+    progress_callback: ProgressCallback | None,
+    max_file_size: int,
+    max_files: int,
+    max_entries: int,
+    max_chunks_per_file: int,
+    cancellation_callback: CancellationCallback | None,
+) -> IndexingReport:
+    """Build and promote a private snapshot while owning the database lock."""
+
+    raise_if_indexing_cancelled(cancellation_callback)
+    _emit_progress(
+        progress_callback,
+        "model",
+        0,
+        1,
+        f"Initializing embedding model {embedder.model}",
+    )
+    raise_if_indexing_cancelled(cancellation_callback)
+    embedding_dimension = embedder.dimension
+    raise_if_indexing_cancelled(cancellation_callback)
+    _emit_progress(
+        progress_callback,
+        "model",
+        1,
+        1,
+        f"Embedding model ready ({embedding_dimension} dimensions)",
+    )
+    raise_if_indexing_cancelled(cancellation_callback)
+
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{database_path.stem}-",
+        suffix=".tmp",
+        dir=database_path.parent,
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+
+    try:
+        raise_if_indexing_cancelled(cancellation_callback)
+        if database_path.exists():
+            SQLiteIndexStore(database_path).backup_to(temporary_path)
+        raise_if_indexing_cancelled(cancellation_callback)
+
+        report = _index_to_sqlite_in_place(
+            root=root,
+            embedder=embedder,
+            database_path=temporary_path,
+            reported_database_path=database_path,
+            progress_callback=progress_callback,
+            embedding_dimension=embedding_dimension,
+            max_file_size=max_file_size,
+            max_files=max_files,
+            max_entries=max_entries,
+            max_chunks_per_file=max_chunks_per_file,
+            cancellation_callback=cancellation_callback,
+        )
+        raise_if_indexing_cancelled(cancellation_callback)
+        _emit_progress(
+            progress_callback,
+            "promote",
+            0,
+            1,
+            "Promoting staged SQLite index",
+        )
+        # This is the final cancellable boundary. Once os.replace starts, the
+        # staged snapshot is the committed index and post-commit reporting is
+        # deliberately best effort.
+        raise_if_indexing_cancelled(cancellation_callback)
+        os.replace(temporary_path, database_path)
+        _emit_progress_best_effort(
+            progress_callback,
+            "promote",
+            1,
+            1,
+            "Staged SQLite index promoted",
+        )
+        _emit_progress_best_effort(
+            progress_callback,
+            "complete",
+            1,
+            1,
+            (
+                f"Indexed {report.file_count} files, {report.chunk_count} chunks, "
+                f"{report.embedding_count} embeddings"
+            ),
+        )
+        return report
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _index_to_sqlite_in_place(
+    root: Path,
+    embedder: Embedder,
+    database_path: Path,
+    reported_database_path: Path,
+    progress_callback: ProgressCallback | None,
+    embedding_dimension: int,
+    max_file_size: int,
+    max_files: int,
+    max_entries: int,
+    max_chunks_per_file: int,
+    cancellation_callback: CancellationCallback | None,
+) -> IndexingReport:
+    """Apply one incremental indexing run to a private SQLite snapshot."""
+
+    raise_if_indexing_cancelled(cancellation_callback)
+    granular_cancellation_callback = _indexing_cancellation_adapter(
+        cancellation_callback
+    )
     store = SQLiteIndexStore(database_path)
     store.initialize()
+    raise_if_indexing_cancelled(cancellation_callback)
 
     index_format_version = "1"
+    previous_repository = store.load_latest_repository(
+        absolute_path=str(root),
+        index_format_version=index_format_version,
+    )
     existing_repository = store.load_repository_by_identity(
         absolute_path=str(root),
         index_format_version=index_format_version,
+        embedding_provider=embedder.provider,
         embedding_model=embedder.model,
-        embedding_dim=embedder.dimension,
+        embedding_dim=embedding_dimension,
     )
 
     repository_id = existing_repository.id if existing_repository else uuid.uuid4()
@@ -280,25 +492,27 @@ def index_to_sqlite(
         absolute_path=str(root),
         index_format_version=index_format_version,
         timestamp_of_index=int(datetime.now(UTC).timestamp()),
+        embedding_provider=embedder.provider,
         embedding_model=embedder.model,
-        embedding_dim=embedder.dimension,
+        embedding_dim=embedding_dimension,
     )
 
     _emit_progress(progress_callback, "load", 0, 1, "Loading previous index")
+    raise_if_indexing_cancelled(cancellation_callback)
     previous_files = store.load_files(repository_id) if existing_repository else {}
-    reusable_embeddings = (
-        store.load_embeddings_by_content_hash(
-            repository_id,
-            repository.embedding_model,
-            repository.embedding_dim,
-        )
-        if existing_repository
-        else {}
-    )
     _emit_progress(progress_callback, "load", 1, 1, "Previous index loaded")
+    raise_if_indexing_cancelled(cancellation_callback)
 
     _emit_progress(progress_callback, "walk", 0, 1, "Walking repository")
-    current_paths = walk(root)
+    raise_if_indexing_cancelled(cancellation_callback)
+    current_paths = walk(
+        root,
+        max_file_size=max_file_size,
+        max_files=max_files,
+        max_entries=max_entries,
+        cancellation_callback=granular_cancellation_callback,
+    )
+    raise_if_indexing_cancelled(cancellation_callback)
     _emit_progress(
         progress_callback,
         "walk",
@@ -307,20 +521,25 @@ def index_to_sqlite(
         f"Found {len(current_paths)} supported source files",
     )
     _emit_progress(progress_callback, "compare", 0, len(current_paths), "Hashing files")
-    current_files = _file_records_for_paths(root, repository_id, current_paths)
-    current_files_by_path = {file.relative_path: file for file in current_files}
-
-    previous_paths = set(previous_files)
-    current_path_names = set(current_files_by_path)
-
-    deleted_paths = sorted(previous_paths - current_path_names)
-    added_paths = sorted(current_path_names - previous_paths)
-    changed_paths = sorted(
-        path_name
-        for path_name in current_path_names.intersection(previous_paths)
-        if current_files_by_path[path_name].content_hash
-        != previous_files[path_name].content_hash
+    raise_if_indexing_cancelled(cancellation_callback)
+    current_files_by_path = build_file_manifest(
+        root,
+        repository_id,
+        relative_paths=current_paths,
+        max_file_size=max_file_size,
+        max_files=max_files,
+        max_entries=max_entries,
+        cancellation_callback=granular_cancellation_callback,
     )
+    raise_if_indexing_cancelled(cancellation_callback)
+    manifest_diff = compare_file_manifests(
+        current_files_by_path,
+        previous_files,
+        cancellation_callback=granular_cancellation_callback,
+    )
+    deleted_paths = manifest_diff.deleted_paths
+    added_paths = manifest_diff.added_paths
+    changed_paths = manifest_diff.changed_paths
     paths_to_process = added_paths + changed_paths
     _emit_progress(
         progress_callback,
@@ -333,12 +552,25 @@ def index_to_sqlite(
         ),
     )
 
-    changed_file_indexes: list[IndexedFileRecords] = []
     errors: list[IndexingError] = []
     embedded_chunk_count = 0
     reused_embedding_count = 0
+    written_file_count = 0
+
+    # The index is being built in a private SQLite snapshot, so successful
+    # files can be committed one at a time without exposing a partial index.
+    # Keeping only one file's symbols, chunks, and vectors in memory prevents
+    # repository size from determining peak indexing memory.
+    _emit_progress(
+        progress_callback,
+        "write",
+        0,
+        len(paths_to_process) + len(deleted_paths),
+        "Writing changed files to staged SQLite index",
+    )
 
     for index_number, relative_path in enumerate(paths_to_process, start=1):
+        raise_if_indexing_cancelled(cancellation_callback)
         _emit_progress(
             progress_callback,
             "index",
@@ -346,11 +578,35 @@ def index_to_sqlite(
             len(paths_to_process),
             f"Indexing {relative_path}",
         )
+        raise_if_indexing_cancelled(cancellation_callback)
         file_record = current_files_by_path[relative_path]
-        file_index = _index_single_file(root, repository_id, relative_path)
+        _emit_progress(
+            progress_callback,
+            "parse",
+            index_number - 1,
+            len(paths_to_process),
+            f"Parsing {relative_path}",
+        )
+        raise_if_indexing_cancelled(cancellation_callback)
+        file_index = _index_single_file(
+            root,
+            repository_id,
+            relative_path,
+            max_file_size,
+            max_chunks_per_file,
+            expected_content_hash=file_record.content_hash,
+        )
+        raise_if_indexing_cancelled(cancellation_callback)
         errors.extend(file_index.errors)
 
         if file_index.errors:
+            _emit_progress(
+                progress_callback,
+                "parse",
+                index_number,
+                len(paths_to_process),
+                f"Skipped {relative_path} after parsing error",
+            )
             _emit_progress(
                 progress_callback,
                 "index",
@@ -360,22 +616,73 @@ def index_to_sqlite(
             )
             continue
 
+        _emit_progress(
+            progress_callback,
+            "parse",
+            index_number,
+            len(paths_to_process),
+            f"Parsed {relative_path}",
+        )
+        _emit_progress(
+            progress_callback,
+            "embed",
+            index_number - 1,
+            len(paths_to_process),
+            f"Embedding changed chunks from {relative_path}",
+        )
+        raise_if_indexing_cancelled(cancellation_callback)
+        reusable_embeddings = (
+            store.load_embeddings_by_content_hashes(
+                repository_id,
+                repository.embedding_model,
+                repository.embedding_dim,
+                (chunk.content_hash for chunk in file_index.chunks),
+            )
+            if existing_repository
+            else {}
+        )
+        raise_if_indexing_cancelled(cancellation_callback)
         embeddings, embedded_count, reused_count = _embeddings_for_chunks(
             file_index.chunks,
             file_index.symbols,
             reusable_embeddings,
             embedder,
         )
+        raise_if_indexing_cancelled(cancellation_callback)
         embedded_chunk_count += embedded_count
         reused_embedding_count += reused_count
+        _emit_progress(
+            progress_callback,
+            "embed",
+            index_number,
+            len(paths_to_process),
+            (
+                f"Embedded {embedded_count} and reused {reused_count} chunks "
+                f"from {relative_path}"
+            ),
+        )
 
-        changed_file_indexes.append(
-            IndexedFileRecords(
-                file=file_record,
-                symbols=file_index.symbols,
-                chunks=file_index.chunks,
-                embeddings=embeddings,
-            )
+        raise_if_indexing_cancelled(cancellation_callback)
+        store.apply_file_updates(
+            repository=repository,
+            changed_files=[
+                IndexedFileRecords(
+                    file=file_record,
+                    symbols=file_index.symbols,
+                    chunks=file_index.chunks,
+                    embeddings=embeddings,
+                )
+            ],
+            deleted_relative_paths=[],
+        )
+        raise_if_indexing_cancelled(cancellation_callback)
+        written_file_count += 1
+        _emit_progress(
+            progress_callback,
+            "write",
+            written_file_count,
+            len(paths_to_process) + len(deleted_paths),
+            f"Wrote {relative_path} to staged SQLite index",
         )
         _emit_progress(
             progress_callback,
@@ -388,19 +695,32 @@ def index_to_sqlite(
     if not paths_to_process:
         _emit_progress(progress_callback, "index", 0, 0, "No file changes to index")
 
-    total_database_changes = len(changed_file_indexes) + len(deleted_paths)
-    _emit_progress(
-        progress_callback,
-        "write",
-        0,
-        total_database_changes,
-        "Writing SQLite index",
+    incompatible_rebuild = (
+        previous_repository is not None and existing_repository is None
     )
+    if incompatible_rebuild and errors:
+        failed_paths = ", ".join(error.relative_path for error in errors[:3])
+        if len(errors) > 3:
+            failed_paths = f"{failed_paths}, and {len(errors) - 3} more"
+        raise RuntimeError(
+            "Embedding configuration changed, but a complete rebuild failed for "
+            f"{failed_paths}; the previous index was preserved"
+        )
+
+    # Finalize deletions and always upsert repository metadata, including for an
+    # empty repository or a no-op reindex. Incompatible historical rows remain
+    # present until the replacement has been built successfully.
+    raise_if_indexing_cancelled(cancellation_callback)
     store.apply_file_updates(
         repository=repository,
-        changed_files=changed_file_indexes,
+        changed_files=[],
         deleted_relative_paths=deleted_paths,
     )
+    raise_if_indexing_cancelled(cancellation_callback)
+    if existing_repository is None:
+        store.delete_other_repositories_by_path(str(root), repository.id)
+    raise_if_indexing_cancelled(cancellation_callback)
+    total_database_changes = written_file_count + len(deleted_paths)
     _emit_progress(
         progress_callback,
         "write",
@@ -411,7 +731,7 @@ def index_to_sqlite(
 
     report = IndexingReport(
         repository=repository,
-        database_path=database_path,
+        database_path=reported_database_path,
         symbol_count=store.count_rows("symbols", repository.id),
         chunk_count=store.count_rows("chunks", repository.id),
         embedding_count=store.count_rows("embeddings", repository.id),
@@ -422,17 +742,7 @@ def index_to_sqlite(
         embedded_chunk_count=embedded_chunk_count,
         reused_embedding_count=reused_embedding_count,
         errors=errors,
-    )
-
-    _emit_progress(
-        progress_callback,
-        "complete",
-        1,
-        1,
-        (
-            f"Indexed {report.file_count} files, {report.chunk_count} chunks, "
-            f"{report.embedding_count} embeddings"
-        ),
+        changed_paths=manifest_diff.all_changed_paths,
     )
 
     return report
@@ -460,6 +770,21 @@ def _emit_progress(
     )
 
 
+def _emit_progress_best_effort(
+    callback: ProgressCallback | None,
+    stage: str,
+    current: int,
+    total: int,
+    message: str,
+) -> None:
+    """Report post-commit progress without changing the committed outcome."""
+
+    try:
+        _emit_progress(callback, stage, current, total, message)
+    except Exception:
+        return
+
+
 @dataclass
 class _FileIndex:
     """Index artifacts generated from one changed file."""
@@ -476,13 +801,18 @@ def _index_single_file(
     repository_id: uuid.UUID,
     # POSIX repository-relative source path.
     relative_path: str,
+    max_file_size: int,
+    max_chunks: int = 2_048,
+    expected_content_hash: str | None = None,
 ) -> _FileIndex:
     """Parse and chunk one source file."""
 
-    absolute_path = root / relative_path
-
     try:
-        source = absolute_path.read_text(encoding="utf-8")
+        source, content_hash = _read_source_text_and_hash(
+            root,
+            relative_path,
+            max_file_size,
+        )
     except (OSError, UnicodeDecodeError) as error:
         return _FileIndex(
             symbols=[],
@@ -492,6 +822,22 @@ def _index_single_file(
                     relative_path=relative_path,
                     stage="read",
                     message=str(error),
+                )
+            ],
+        )
+
+    if (
+        expected_content_hash is not None
+        and content_hash != expected_content_hash
+    ):
+        return _FileIndex(
+            symbols=[],
+            chunks=[],
+            errors=[
+                IndexingError(
+                    relative_path=relative_path,
+                    stage="read",
+                    message="Source file changed during indexing; retry",
                 )
             ],
         )
@@ -527,7 +873,7 @@ def _index_single_file(
     ]
 
     try:
-        chunks = chunk_symbols(source, symbols)
+        chunks = chunk_symbols(source, symbols, max_chunks=max_chunks)
     except ValueError as error:
         return _FileIndex(
             symbols=symbols,
@@ -542,6 +888,45 @@ def _index_single_file(
         )
 
     return _FileIndex(symbols=symbols, chunks=chunks, errors=[])
+
+
+def _read_source_text(
+    root: Path,
+    relative_path: str | Path,
+    max_file_size: int,
+) -> str:
+    """Read one confined UTF-8 source file without following a final symlink."""
+
+    source, _content_hash = _read_source_text_and_hash(
+        root,
+        relative_path,
+        max_file_size,
+    )
+    return source
+
+
+def _read_source_text_and_hash(
+    root: Path,
+    relative_path: str | Path,
+    max_file_size: int,
+) -> tuple[str, str]:
+    """Read source text and return the hash of the same verified bytes."""
+
+    absolute_path = root / relative_path
+    if absolute_path.is_symlink():
+        raise OSError("Refusing to read a symbolic link")
+    resolved_path = absolute_path.resolve(strict=True)
+    if resolved_path != root and root not in resolved_path.parents:
+        raise OSError("Refusing to read a path outside the repository")
+
+    _, source_bytes = read_regular_file(
+        absolute_path,
+        byte_limit=max_file_size + 1,
+    )
+
+    if len(source_bytes) > max_file_size:
+        raise OSError(f"Source file exceeds the {max_file_size} byte limit")
+    return source_bytes.decode("utf-8"), hashlib.sha256(source_bytes).hexdigest()
 
 
 def _embeddings_for_chunks(
@@ -615,33 +1000,3 @@ def _embedding_text_for_chunk(
         qualified_name=symbol.qualified_name if symbol else None,
         kind=symbol.kind if symbol else None,
     )
-
-
-def _file_records_for_paths(
-    # Canonical repository root used by the current index.
-    root: Path,
-    # Stable repository ID used for the current persisted index.
-    repository_id: uuid.UUID,
-    # Repository-relative paths selected by the walker.
-    relative_paths: list[Path],
-) -> list[IndexedFile]:
-    """Build file metadata records for current source files."""
-
-    files: list[IndexedFile] = []
-
-    for relative_path in relative_paths:
-        absolute_path = root / relative_path
-        stat = absolute_path.stat()
-        content_hash = hashlib.sha256(absolute_path.read_bytes()).hexdigest()
-
-        files.append(
-            IndexedFile(
-                repository_id=repository_id,
-                relative_path=relative_path.as_posix(),
-                modified_time_ns=stat.st_mtime_ns,
-                size_bytes=stat.st_size,
-                content_hash=content_hash,
-            )
-        )
-
-    return files

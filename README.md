@@ -1,4 +1,7 @@
-# FireLens
+### ⚡ TL;DR
+Coding agents fail partly because they retrieve code that is textually similar but structurally irrelevant. FireLens combines lexical, semantic, and repository-graph signals to retrieve the smallest context needed to complete a task.
+
+# 🔥 FireLens
 
 FireLens is a local-first code retrieval engine for Python repositories.
 
@@ -13,9 +16,15 @@ FireLens is not a chatbot. Retrieval and indexing are the product.
 - exact symbol-name search
 - fuzzy symbol-name search using normalized Levenshtein similarity
 - semantic code search using normalized vector similarity
-- Streamlit interface for indexing and all three search modes
+- exact-first automatic routing between all three search modes
+- local STDIO MCP tools for coding agents
+- JSON CLI for indexing, freshness checks, and search
+- Streamlit interface for indexing and all search modes
 - Incremental reindexing based on file content changes
 - Embedding reuse when chunk content has not changed
+- Atomic index replacement after successful indexing
+- Cross-process index/read locking for CLI, Streamlit, and MCP
+- Bounded snippets and repository allowlists for agent-safe retrieval
 - Root `.gitignore` support during repository walking
 - configurable per-file and repository file-count limits
 - Optional progress callbacks for indexing status updates
@@ -27,7 +36,11 @@ FireLens is not a chatbot. Retrieval and indexing are the product.
 
 For real semantic embeddings, install project dependencies and provide a
 Hugging Face token in `.env` or the shell as `HF_TOKEN` if the model requires
-authentication.
+authentication. FireLens loads `.env` only from its own checkout; a source
+directory being indexed cannot override MCP configuration with its own `.env`.
+Source checkouts store indexes under `data/indexes` by default. Installed
+packages use the current user's platform data directory instead; set
+`FIRELENS_DATA_DIR` when you want an explicit location.
 
 ## Install
 
@@ -37,19 +50,214 @@ cd firelens
 uv sync
 ```
 
+Legacy GitHub/chat modules are excluded from the default environment. Install
+their old dependencies only when maintaining that compatibility code:
+
+```bash
+uv sync --extra legacy
+```
+
+## Use the CLI
+
+Indexing is explicit. Check status, build or refresh the index when needed, and
+then search it:
+
+```bash
+uv run firelens status ~/projects/firelens
+uv run firelens index ~/projects/firelens
+uv run firelens search ~/projects/firelens "SQLiteIndexStore" --mode auto
+uv run firelens search ~/projects/firelens "where are indexes persisted?" \
+  --mode semantic --top-k 5 --path app/storage
+```
+
+Commands write structured JSON to stdout. Indexing progress and errors go to
+stderr, so stdout remains safe to pipe into another program.
+
+## Use FireLens as an MCP server
+
+FireLens exposes `index_repository`, `get_index_status`, and `search_code` over
+local STDIO. The server is silent on human-readable stdout because stdout is
+the MCP protocol stream. Start it directly when testing the process:
+
+```bash
+FIRELENS_ALLOWED_ROOTS=/absolute/path/to/repositories \
+FIRELENS_DATA_DIR=/absolute/path/to/firelens-data \
+uv run --project /absolute/path/to/firelens firelens-mcp
+```
+
+Keep the process running and connect an MCP client to its stdin/stdout; do not
+type commands into the terminal. A model-free contract test is available:
+
+```bash
+uv run python -m unittest \
+  tests.test_interfaces.McpStdioContractTests.test_stdio_server_lifecycle_with_real_services_and_fake_embedder -v
+```
+
+`FIRELENS_ALLOWED_ROOTS` controls which repositories an agent may index or
+search. Separate macOS/Linux roots with `:` and Windows roots with `;`.
+`FIRELENS_DATA_DIR` is the parent directory for persisted indexes; each
+repository database is stored below a sanitized repository name and a hash of
+its canonical absolute path. All clients share an index when they use the same
+data directory and canonical repository path. Use absolute paths in client
+configuration, and keep the data directory outside the source roots.
+
+The normal agent workflow is: call `get_index_status`, call
+`index_repository` when the status is `missing` or `stale`, then call
+`search_code`. The first semantic index can download and initialize
+CodeRankEmbed; set a generous tool timeout and provide `HF_TOKEN` when the
+model requires authentication.
+
+## Connect Codex through MCP
+
+FireLens exposes `index_repository`, `get_index_status`, and `search_code` over
+local STDIO. Add this configuration to `~/.codex/config.toml`, or to
+`.codex/config.toml` inside a trusted project, using absolute paths:
+
+```toml
+[mcp_servers.firelens]
+command = "uv"
+args = [
+  "run",
+  "--project",
+  "/absolute/path/to/firelens",
+  "firelens-mcp",
+]
+startup_timeout_sec = 30
+tool_timeout_sec = 600
+env_vars = ["HF_TOKEN"]
+
+[mcp_servers.firelens.env]
+FIRELENS_ALLOWED_ROOTS = "/absolute/repo/one:/absolute/repo/two"
+FIRELENS_DATA_DIR = "/absolute/path/to/firelens/data/indexes"
+```
+
+For multiple allowed source directories on macOS or Linux, separate roots with
+`:`, and use `;` on Windows. A root can be any local source directory; it does
+not need to be a Git checkout. Symlinks are resolved before the allowlist
+check, and symlinked source files are not indexed.
+
+You can alternatively create the basic entry from a shell:
+
+```bash
+codex mcp add firelens \
+  --env FIRELENS_ALLOWED_ROOTS=/absolute/path/to/repositories \
+  --env FIRELENS_DATA_DIR=/absolute/path/to/firelens/data/indexes \
+  -- uv run --project /absolute/path/to/firelens firelens-mcp
+```
+
+The registration command does not set tool timeouts. After running it, edit the
+generated `mcp_servers.firelens` entry and add `startup_timeout_sec = 30` and
+`tool_timeout_sec = 600` as shown above. Confirm registration with
+`codex mcp list`; inside Codex, `/mcp` shows the connected tools. Restart Codex
+after changing MCP configuration.
+
+The intended agent workflow is:
+
+1. Call `get_index_status`.
+2. Call `index_repository` when status is `missing` or `stale`.
+3. Call `search_code` for bounded code context.
+
+`search_code` deliberately does not scan for file changes. This keeps queries
+fast and predictable; freshness is an explicit status operation. The first
+index may download and initialize CodeRankEmbed, so the example configuration
+allows a ten-minute tool timeout. If the semantic model cannot load, indexing
+fails without replacing the previous valid database.
+
+MCP cancellation is cooperative. FireLens waits for the worker to release its
+repository lease, database lock, and staged files before returning a cancelled
+request; model encoding and NumPy operations stop at their next safe boundary.
+
+## Connect Pi through MCP
+
+Pi's MCP support is provided by the `pi-mcp-extension` package. Install it
+once, then create `.pi/mcp.json` in a project or `~/.pi/agent/mcp.json` for a
+user-wide connection:
+
+```bash
+pi install npm:pi-mcp-extension
+```
+
+```json
+{
+  "mcpServers": {
+    "firelens": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/absolute/path/to/firelens",
+        "firelens-mcp"
+      ],
+      "transport": "stdio",
+      "lifecycle": "eager",
+      "env": {
+        "FIRELENS_ALLOWED_ROOTS": "/absolute/path/to/repositories",
+        "FIRELENS_DATA_DIR": "/absolute/path/to/firelens-data"
+      }
+    }
+  }
+}
+```
+
+Start Pi in the configured project and use `/mcp` to inspect the server. If it
+is configured for lazy startup, `/mcp:start firelens` starts it explicitly.
+
+## Connect Claude Code through MCP
+
+Claude Code can register the local server from its CLI. Options must come
+before the server name, and `--` separates Claude's arguments from the command
+used to start FireLens:
+
+```bash
+claude mcp add --transport stdio \
+  --env FIRELENS_ALLOWED_ROOTS=/absolute/path/to/repositories \
+  --env FIRELENS_DATA_DIR=/absolute/path/to/firelens-data \
+  firelens -- \
+  uv run --project /absolute/path/to/firelens firelens-mcp
+```
+
+Check it with `claude mcp list` or `claude mcp get firelens`; inside Claude
+Code, `/mcp` shows connection status and available tools. For a shareable
+project-scoped setup, put this in `.mcp.json` at the project root instead:
+
+```json
+{
+  "mcpServers": {
+    "firelens": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/absolute/path/to/firelens",
+        "firelens-mcp"
+      ],
+      "env": {
+        "FIRELENS_ALLOWED_ROOTS": "/absolute/path/to/repositories",
+        "FIRELENS_DATA_DIR": "/absolute/path/to/firelens-data",
+        "HF_TOKEN": "${HF_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Claude Code asks for approval before using a project-scoped `.mcp.json`.
+Restart or reload the harness after changing its MCP configuration.
+
 ## Run the Streamlit interface
 
 ```bash
-uv run streamlit run app/client/streamlit_app.py
+uv run streamlit run app/client/streamlit_app.py --server.fileWatcherType none
 ```
 
 In the sidebar:
 
 1. Select an existing index or enter a new repository path.
 2. Click **Index / Re-index** when the repository needs indexing.
-3. Choose `exact`, `fuzzy`, or `semantic`.
-4. Enter a query and optionally restrict it to an exact repository-relative
-   path.
+3. Choose `auto`, `exact`, `fuzzy`, or `semantic` and a compute backend.
+4. Enter a query and optionally restrict it to a repository-relative file or
+   directory prefix.
 
 Use exact search for known symbol names, fuzzy search for partial or misspelled
 identifiers, and semantic search for natural-language questions such as:
@@ -102,6 +310,10 @@ FireLens now:
 - removes records for deleted files
 - reuses stored embeddings when chunk content hashes still match
 - preserves previous valid records if a changed file fails parsing
+- stages all database changes and atomically promotes a successful index
+- writes changed files to the private snapshot one at a time to bound memory
+- coordinates readers and indexers across FireLens processes with adjacent
+  `firelens.db.lock` and `firelens.db.lock.intent` files
 
 Clicking **Index / Re-index** in Streamlit uses this incremental behavior.
 Unchanged files are not parsed or embedded again. To force a complete rebuild,
@@ -128,11 +340,15 @@ report = index_to_sqlite(
 
 Progress stages currently include:
 
+- `model`
 - `load`
 - `walk`
 - `compare`
 - `index`
+- `parse`
+- `embed`
 - `write`
+- `promote`
 - `complete`
 
 ## `.gitignore` behavior
@@ -147,21 +363,44 @@ common cases needed for repository indexing:
 - glob rules such as `*.generated.py`
 - negation rules such as `!keep.py`
 
+The root `.gitignore` is limited to 512 active rules.
+
 FireLens also ignores built-in paths such as `.git`, virtualenv directories,
-`node_modules`, and Python caches.
+`node_modules`, and Python caches. Its root `data/` directory is reserved for
+local indexes; nested source packages such as `app/data/` remain indexable.
 
 By default, the walker skips source files larger than one megabyte and rejects
-repositories containing more than 10,000 accepted source files.
+repositories containing more than 10,000 accepted source files. It also stops
+after scanning 100,000 directory entries and limits each source file to 2,048
+semantic chunks. Configure these caps with `FIRELENS_MAX_FILE_SIZE_BYTES`,
+`FIRELENS_MAX_REPOSITORY_FILES`, `FIRELENS_MAX_WALK_ENTRIES`, and
+`FIRELENS_MAX_CHUNKS_PER_FILE`.
+
+Search also has hard candidate and memory bounds. Fuzzy ranking accepts at
+most 512 symbol candidates; semantic search accepts at most 50,000 chunks
+and 192 MiB of vector data. Narrow the path filter when a repository exceeds a
+bound. The defaults can be reduced with `FIRELENS_MAX_FUZZY_CANDIDATES`,
+`FIRELENS_MAX_SEMANTIC_CANDIDATES`, and
+`FIRELENS_MAX_SEMANTIC_INDEX_BYTES`.
 
 ## Embeddings
 
 The real semantic embedder is `CodeRankEmbedder`, which loads:
 
 ```text
-nomic-ai/CodeRankEmbed
+nomic-ai/CodeRankEmbed@3c4b60807d71f79b43f3c4363786d9493691f8b1
 ```
 
-through `sentence-transformers`.
+through `sentence-transformers`. Pinning the Hugging Face revision keeps remote
+custom code and vector identity reproducible.
+
+Override `FIRELENS_EMBEDDING_MODEL` only with a compatible model that follows
+the same code-search query instruction contract, and set
+`FIRELENS_EMBEDDING_REVISION` to an immutable commit for that model. Changing
+the configured provider, model, or revision marks the existing index stale.
+Set `FIRELENS_EMBEDDING_DIMENSION` to the model's output size. Changing that
+value marks an existing index stale, and a vector-dimension mismatch discovered
+during indexing fails before the staged database can replace a valid index.
 
 Code chunks are embedded as documents. Natural-language queries receive the
 CodeRank code-search instruction required by the model. Embeddings are
@@ -219,18 +458,13 @@ LIMIT 20;
 ## Run tests
 
 ```bash
-uv run python -m unittest \
-  tests.test_indexing_basics \
-  tests.test_storage_database \
-  tests.test_indexing_persistence
+uv run python -m unittest discover -s tests -v
 ```
 
 ## Near-term gaps
 
 - semantic-search quality evaluation and threshold calibration
 - module-level semantic chunks for imports, constants, and executable code
-- automatic routing between exact, fuzzy, and semantic modes
-- cached in-memory vector matrices for larger repositories
 - Mojo acceleration and Python/Mojo result parity tests
 - Only Python repositories are parsed today.
 - `.gitignore` support is intentionally lightweight and limited to the root

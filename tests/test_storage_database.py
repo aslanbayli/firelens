@@ -4,15 +4,31 @@ import uuid
 from pathlib import Path
 
 from app.core.models import Chunk, Repository, Symbol
+from app.search.semantic import load_semantic_search_index
 from app.storage.database import (
     IndexedFile,
     SQLiteIndexStore,
+    default_database_path,
     pack_vector,
     unpack_vector,
 )
 
 
 class SQLiteIndexStoreTests(unittest.TestCase):
+    def test_default_database_path_bounds_a_long_repository_name(self) -> None:
+        repository_root = Path("/") / ("a" * 255)
+
+        database_path = default_database_path(
+            repository_root,
+            data_directory="indexes",
+        )
+
+        self.assertLessEqual(len(database_path.parent.name.encode("utf-8")), 255)
+        readable_name, path_hash = database_path.parent.name.rsplit("-", 1)
+        self.assertEqual(len(readable_name), 64)
+        self.assertEqual(len(path_hash), 12)
+        self.assertTrue(all(character in "0123456789abcdef" for character in path_hash))
+
     def test_pack_vector_round_trips_float_values(self) -> None:
         vector = [0.25, -0.5, 1.0]
 
@@ -136,6 +152,80 @@ class SQLiteIndexStoreTests(unittest.TestCase):
             ["Worker.run"],
         )
 
+    def test_search_loaders_keep_candidates_bounded_and_fetch_results_lazily(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteIndexStore(Path(temp_dir) / "firelens.db")
+            repository, files, symbols, chunks, embeddings = _sample_index()
+            symbols.append(
+                Symbol(
+                    id=uuid.uuid4(),
+                    repository_id=repository.id,
+                    name="helper",
+                    qualified_name="Service.helper",
+                    kind="method",
+                    relative_path="example.py",
+                    start_line=4,
+                    end_line=5,
+                    source_snippet="    def helper(self):\n        pass\n",
+                )
+            )
+            store.initialize()
+            store.replace_index(repository, files, symbols, chunks, embeddings)
+
+            with self.assertRaisesRegex(ValueError, "candidate limit"):
+                store.load_symbol_candidates(
+                    repository.id,
+                    limit=1,
+                    candidate_char_limit=512,
+                )
+
+            candidates = store.load_symbol_candidates(
+                repository.id,
+                limit=2,
+                candidate_char_limit=512,
+            )
+            loaded_symbols = store.load_symbols_by_ids(
+                (candidate.id for candidate in candidates),
+                max_snippet_chars=4_000,
+            )
+            summary = store.semantic_candidate_summary(
+                repository.id,
+                max_candidates=10,
+                max_vector_bytes=1_024,
+            )
+            semantic_rows = list(store.iter_semantic_candidate_rows(repository.id))
+            chunk_texts = store.load_chunk_texts(
+                [chunks[0].id],
+                max_chars=4_000,
+            )
+            semantic_index = load_semantic_search_index(
+                store,
+                repository.id,
+                max_candidates=10,
+                max_vector_bytes=1_024,
+            )
+            with self.assertRaisesRegex(ValueError, "vector memory limit"):
+                load_semantic_search_index(
+                    store,
+                    repository.id,
+                    max_candidates=10,
+                    max_vector_bytes=1,
+                )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            set(loaded_symbols),
+            {candidate.id for candidate in candidates},
+        )
+        self.assertEqual(summary.count, 1)
+        self.assertEqual(summary.dimension, repository.embedding_dim)
+        self.assertEqual(summary.vector_bytes, repository.embedding_dim * 4)
+        self.assertEqual(semantic_rows[0].candidate.chunk_id, chunks[0].id)
+        self.assertEqual(chunk_texts[chunks[0].id], chunks[0].raw_text)
+        self.assertEqual(semantic_index.matrix.shape, (1, repository.embedding_dim))
+
 
 def _sample_index() -> tuple[
     Repository,
@@ -153,6 +243,7 @@ def _sample_index() -> tuple[
         absolute_path="/tmp/example",
         index_format_version="1",
         timestamp_of_index=1,
+        embedding_provider="test",
         embedding_model="test-model",
         embedding_dim=3,
     )

@@ -1,15 +1,33 @@
 [project]
 name = "firelens"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local-first hybrid code retrieval for coding agents"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "einops>=0.8.2",
-    "fastapi[standard]>=0.138,<0.139",
-    "openai>=2.44,<3",
+    "mcp>=2,<3",
+    "numpy>=2.4,<3",
+    "pydantic>=2.12,<3",
     "pydantic-settings>=2.3,<3",
-    "requests>=2.32,<3",
-    "sentence-transformers>=5.6.0",
+    "sentence-transformers>=5.6.0,<6",
     "streamlit>=1.58,<2",
 ]
+
+[project.optional-dependencies]
+legacy = [
+    "fastapi[standard]>=0.138,<0.139",
+    "openai>=2.44,<3",
+    "requests>=2.32,<3",
+]
+
+[project.scripts]
+firelens = "app.interfaces.cli:main"
+firelens-mcp = "app.interfaces.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
