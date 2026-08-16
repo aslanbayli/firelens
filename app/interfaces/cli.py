@@ -26,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("query")
     search_parser.add_argument(
         "--mode",
-        choices=("auto", "exact", "fuzzy", "semantic"),
+        choices=("auto", "exact", "fuzzy", "lexical", "semantic"),
         default="auto",
     )
     search_parser.add_argument("--top-k", type=int, default=5)

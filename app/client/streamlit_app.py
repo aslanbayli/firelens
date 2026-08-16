@@ -57,7 +57,7 @@ def main() -> None:
 
     mode = st.segmented_control(
         "Mode",
-        options=["auto", "exact", "fuzzy", "semantic"],
+        options=["auto", "exact", "fuzzy", "lexical", "semantic"],
         default="auto",
     )
     query = st.text_input("Search")
@@ -117,6 +117,7 @@ def choose_existing_index(runtime: FireLensRuntime) -> AvailableIndex | None:
         options=options,
         format_func=lambda option: (
             f"{Path(option.repository_path).name} - {option.repository_path}"
+            + (" (rebuild required)" if option.status == "stale" else "")
         ),
     )
 
@@ -233,11 +234,13 @@ def render_response(response) -> None:
         with st.expander(label):
             if result.snippet_truncated:
                 st.caption("Snippet truncated to the configured output limit.")
-            st.code(result.snippet, language=_language_for_path(result.file_path))
+            st.code(result.snippet, language=_display_language(result.language))
 
 
-def _language_for_path(file_path: str) -> str:
-    return "python" if Path(file_path).suffix == ".py" else "text"
+def _display_language(language: str) -> str:
+    if language == "restructuredtext":
+        return "rst"
+    return language if language in {"python", "markdown", "rst"} else "text"
 
 
 if __name__ == "__main__":

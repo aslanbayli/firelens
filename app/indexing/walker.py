@@ -12,6 +12,10 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from app.core.cancellation import CancellationCallback, raise_if_cancelled
+from app.indexing.adapters import (
+    DEFAULT_ADAPTER_REGISTRY,
+    LanguageAdapterRegistry,
+)
 from app.indexing.file_io import read_regular_file
 
 DEFAULT_IGNORED_NAMES = {
@@ -25,9 +29,8 @@ DEFAULT_IGNORED_NAMES = {
 }
 ROOT_IGNORED_NAMES = {"data"}
 
-# FireLens currently parses only Python using the standard-library AST. Files
-# from other languages must be excluded until an appropriate parser exists.
-SUPPORTED_SUFFIXES = {".py"}
+# Compatibility export. File eligibility itself is delegated to the registry.
+SUPPORTED_SUFFIXES = set(DEFAULT_ADAPTER_REGISTRY.supported_extensions)
 MAX_GITIGNORE_RULES = 512
 
 
@@ -186,6 +189,7 @@ def walk(
     # Bound all visited directory entries, including ignored and unsupported files.
     max_entries: int = 100_000,
     cancellation_callback: CancellationCallback | None = None,
+    adapter_registry: LanguageAdapterRegistry = DEFAULT_ADAPTER_REGISTRY,
 ) -> list[Path]:
     """Return deterministic source-file paths relative to a repository root."""
 
@@ -267,7 +271,7 @@ def walk(
 
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                if candidate.suffix.lower() not in SUPPORTED_SUFFIXES:
+                if not adapter_registry.supports(relative_path):
                     continue
                 if is_gitignored(
                     relative_path,
@@ -304,9 +308,6 @@ def walk(
                 reverse=True,
             )
         )
-
-    # TODO: Make supported suffixes and generated-file detection configurable
-    # when support for languages beyond Python is added.
 
     # Filesystem traversal order is not guaranteed. Sorting by POSIX-style path
     # produces repeatable indexes and repeatable tests on every run.

@@ -1,5 +1,7 @@
 """Unified code-search service shared by CLI, Streamlit, and MCP."""
 
+import hashlib
+import json
 import threading
 import time
 import uuid
@@ -19,6 +21,7 @@ from app.indexing.embedder import CodeRankEmbedder, Embedder
 from app.indexing.service import INDEX_FORMAT_VERSION
 from app.search.exact import exact_search
 from app.search.fuzzy import fuzzy_search
+from app.search.lexical import LexicalSearchConfig, lexical_search
 from app.search.router import classify_non_exact_query
 from app.search.semantic import (
     SemanticSearchIndex,
@@ -84,6 +87,8 @@ class SearchService:
         self._semantic_active_uses: dict[SemanticCacheKey, int] = {}
         self._semantic_inflight_vector_bytes = 0
         self._semantic_inflight_candidate_count = 0
+        self._lexical_config = LexicalSearchConfig.from_settings(settings)
+        self._retrieval_config = _retrieval_config_identity(settings)
 
     def search(
         self,
@@ -196,6 +201,19 @@ class SearchService:
                     self.settings.mojo_fuzzy_min_candidates
                 ),
             )
+        elif request.request_mode == "lexical":
+            if request.backend == "mojo":
+                raise BackendUnavailableError(
+                    "Lexical search uses the SQLite/Python backend"
+                )
+            response = lexical_search(
+                store,
+                repository.id,
+                request,
+                self._lexical_config,
+                retrieval_config=self._retrieval_config,
+                cancellation_callback=cancellation_callback,
+            )
         else:
             response = self._semantic_search(
                 store,
@@ -210,6 +228,7 @@ class SearchService:
             update={
                 "elapsed_time": time.perf_counter() - started_at,
                 "warnings": [*response.warnings, *backend_warnings],
+                "retrieval_config": self._retrieval_config,
             }
         )
         return self._bound_snippets(
@@ -336,6 +355,7 @@ class SearchService:
                 fallback_backend=(
                     self._python_backend if request.backend == "auto" else None
                 ),
+                score_floor=self.settings.semantic_score_floor,
             )
         finally:
             self._release_semantic_index(cache_key)
@@ -656,3 +676,38 @@ class SearchService:
         return response.model_copy(
             update={"ranked_results": bounded_results, "warnings": warnings}
         )
+
+
+def _retrieval_config_identity(settings: Settings) -> str:
+    """Return a stable, non-secret hash of effective ranking controls."""
+
+    values = {
+        "fuzzy_threshold": settings.fuzzy_threshold,
+        "max_fuzzy_candidates": settings.max_fuzzy_candidates,
+        "max_semantic_candidates": settings.max_semantic_candidates,
+        "semantic_score_floor": settings.semantic_score_floor,
+        "lexical": {
+            "exact_qualified_bonus": settings.lexical_exact_qualified_bonus,
+            "exact_short_bonus": settings.lexical_exact_short_bonus,
+            "path_bonus": settings.lexical_path_bonus,
+            "identifier_bonus": settings.lexical_identifier_bonus,
+            "bm25_bonus": settings.lexical_bm25_bonus,
+            "fuzzy_bonus": settings.lexical_fuzzy_bonus,
+            "exact_limit": settings.lexical_exact_candidate_limit,
+            "path_limit": settings.lexical_path_candidate_limit,
+            "identifier_limit": settings.lexical_identifier_candidate_limit,
+            "bm25_limit": settings.lexical_bm25_candidate_limit,
+            "fuzzy_limit": settings.lexical_fuzzy_candidate_limit,
+            "maximum_documents_ranked": settings.max_lexical_documents_ranked,
+            "bm25_weights": [
+                settings.bm25_name_weight,
+                settings.bm25_qualified_name_weight,
+                settings.bm25_identifier_weight,
+                settings.bm25_path_weight,
+                settings.bm25_content_weight,
+            ],
+        },
+    }
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(encoded).hexdigest()[:12]
+    return f"{settings.retrieval_config_name}:{digest}"

@@ -173,6 +173,7 @@ def semantic_search(
     cancellation_callback: CancellationCallback | None = None,
     backend: AccelerationBackend = _PYTHON_BACKEND,
     fallback_backend: AccelerationBackend | None = None,
+    score_floor: float | None = None,
 ) -> SearchResponse:
     """Search stored code chunks by cosine similarity."""
 
@@ -312,6 +313,8 @@ def semantic_search(
         snippet = raw_text[: request.max_snippet_chars]
 
         public_score = float(np.clip((float(raw_score) + 1.0) / 2.0, 0.0, 1.0))
+        if score_floor is not None and public_score < score_floor:
+            continue
 
         results.append(
             SearchResult(
@@ -321,11 +324,21 @@ def semantic_search(
                 start_line=candidate.start_line,
                 end_line=candidate.end_line,
                 symbol_name=bounded_symbol_name(candidate.qualified_symbol_name),
+                language=candidate.language,
+                semantic_unit_kind=candidate.semantic_unit_kind,
                 snippet=snippet,
                 snippet_truncated=len(snippet) < len(raw_text),
                 score=public_score,
                 mode="semantic",
                 backend=active_backend.name,
+                retrieval_channels=["semantic"],
+                retrieval_evidence=[
+                    {
+                        "channel": "semantic",
+                        "score": public_score,
+                        "rank": len(results) + 1,
+                    }
+                ],
             )
         )
 

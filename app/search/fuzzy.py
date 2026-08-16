@@ -155,11 +155,20 @@ def fuzzy_search(
                 start_line=symbol.start_line,
                 end_line=symbol.end_line,
                 symbol_name=bounded_symbol_name(symbol.qualified_name),
+                language=symbol.language,
                 snippet=snippet,
                 snippet_truncated=len(snippet) < len(symbol.source_snippet),
                 score=score,
                 mode="fuzzy",
                 backend=active_backend.name,
+                retrieval_channels=["fuzzy_symbol"],
+                retrieval_evidence=[
+                    {
+                        "channel": "fuzzy_symbol",
+                        "score": score,
+                        "rank": len(results) + 1,
+                    }
+                ],
             )
         )
 
