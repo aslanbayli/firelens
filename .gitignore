@@ -10,10 +10,11 @@ venv/
 *cache
 
 # local dev
-*.md
+docs/
 !README.md
 !AGENTS.md
 !LICENSE.md
+TODO.md
 
 # Data
 data/

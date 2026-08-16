@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from app.acceleration.protocol import AccelerationBackend, AccelerationError
+from app.acceleration.python_backend import PythonBackend
 from app.core.cancellation import CancellationCallback, raise_if_cancelled
 from app.core.models import SearchRequest, SearchResponse, SearchResult
 from app.indexing.embedder import Embedder
@@ -23,6 +25,9 @@ class SemanticSearchIndex:
 
     candidates: list[StoredSemanticCandidate]
     matrix: np.ndarray
+
+
+_PYTHON_BACKEND = PythonBackend()
 
 
 def load_semantic_search_index(
@@ -166,6 +171,8 @@ def semantic_search(
     embedder: Embedder,
     search_index: SemanticSearchIndex | None = None,
     cancellation_callback: CancellationCallback | None = None,
+    backend: AccelerationBackend = _PYTHON_BACKEND,
+    fallback_backend: AccelerationBackend | None = None,
 ) -> SearchResponse:
     """Search stored code chunks by cosine similarity."""
 
@@ -178,7 +185,7 @@ def semantic_search(
             requested_mode=request.request_mode,
             mode="semantic",
             requested_backend=request.backend,
-            backend="python",
+            backend=backend.name,
             elapsed_time=0.0,
             ranked_results=[],
             warnings=[],
@@ -223,7 +230,7 @@ def semantic_search(
             requested_mode=request.request_mode,
             mode="semantic",
             requested_backend=request.backend,
-            backend="python",
+            backend=backend.name,
             elapsed_time=time.perf_counter() - start_time,
             ranked_results=[],
             warnings=[],
@@ -257,20 +264,34 @@ def semantic_search(
     if query_norm == 0:
         raise ValueError("Query embedding cannot be a zero vector")
 
-    normalized_query = query_vector / query_norm
+    normalized_query = np.ascontiguousarray(
+        query_vector / query_norm,
+        dtype=np.float32,
+    )
 
-    # Embeddings are validated as finite, nonzero unit vectors before storage,
-    # so the persisted matrix does not need another full validation pass here.
+    # Embeddings are validated as finite, nonzero unit vectors before storage.
+    # The selected backend owns the final contiguous-array boundary checks.
     raise_if_cancelled(cancellation_callback)
-    raw_scores = matrix @ normalized_query
-    raw_scores = np.clip(raw_scores, -1.0, 1.0)
+    active_backend = backend
+    warnings: list[str] = []
+    try:
+        ranked_scores = active_backend.semantic_top_k(
+            matrix,
+            normalized_query,
+            request.top_k,
+        )
+    except AccelerationError:
+        if fallback_backend is None:
+            raise
+        active_backend = fallback_backend
+        ranked_scores = active_backend.semantic_top_k(
+            matrix,
+            normalized_query,
+            request.top_k,
+        )
+        warnings.append("Mojo semantic acceleration failed; using Python")
     raise_if_cancelled(cancellation_callback)
-
-    # Sort score indices, not scores themselves. Each index remains connected
-    # to the candidate that supplies the SearchResult metadata.
-    ranked_indices = np.argsort(-raw_scores, kind="stable")
-    raise_if_cancelled(cancellation_callback)
-    selected_indices = ranked_indices[: request.top_k]
+    selected_indices = ranked_scores.indices
     selected_candidates = [candidates[int(index)] for index in selected_indices]
     chunk_texts = store.load_chunk_texts(
         (candidate.chunk_id for candidate in selected_candidates),
@@ -279,19 +300,18 @@ def semantic_search(
     raise_if_cancelled(cancellation_callback)
 
     results: list[SearchResult] = []
-    for candidate_index, candidate in zip(
-        selected_indices,
+    for raw_score, candidate in zip(
+        ranked_scores.scores,
         selected_candidates,
         strict=True,
     ):
         raise_if_cancelled(cancellation_callback)
-        index = int(candidate_index)
         raw_text = chunk_texts.get(candidate.chunk_id)
         if raw_text is None:
             raise ValueError("Ranked semantic chunk was not found")
         snippet = raw_text[: request.max_snippet_chars]
 
-        public_score = float(np.clip((raw_scores[index] + 1.0) / 2.0, 0.0, 1.0))
+        public_score = float(np.clip((float(raw_score) + 1.0) / 2.0, 0.0, 1.0))
 
         results.append(
             SearchResult(
@@ -305,7 +325,7 @@ def semantic_search(
                 snippet_truncated=len(snippet) < len(raw_text),
                 score=public_score,
                 mode="semantic",
-                backend="python",
+                backend=active_backend.name,
             )
         )
 
@@ -314,8 +334,8 @@ def semantic_search(
         requested_mode=request.request_mode,
         mode="semantic",
         requested_backend=request.backend,
-        backend="python",
+        backend=active_backend.name,
         elapsed_time=time.perf_counter() - start_time,
         ranked_results=results,
-        warnings=[],
+        warnings=warnings,
     )

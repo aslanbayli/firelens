@@ -15,6 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+mojo = [
+    "mojo==1.0.0",
+]
 legacy = [
     "fastapi[standard]>=0.138,<0.139",
     "openai>=2.44,<3",

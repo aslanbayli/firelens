@@ -4,6 +4,7 @@ import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from app.acceleration.protocol import AccelerationBackend
 from app.core.cancellation import CancellationCallback
 from app.core.config import Settings, settings as default_settings
 from app.core.coordinator import RepositoryCoordinator
@@ -32,6 +33,7 @@ class FireLensRuntime:
         self,
         settings: Settings = default_settings,
         embedder_factory: EmbedderFactory | None = None,
+        mojo_backend: AccelerationBackend | None = None,
     ) -> None:
         resolver = RepositoryResolver(settings)
         coordinator = RepositoryCoordinator()
@@ -45,6 +47,7 @@ class FireLensRuntime:
             resolver=resolver,
             coordinator=coordinator,
             embedder_factory=shared_embedder_factory,
+            mojo_backend=mojo_backend,
         )
         self.index_service = IndexService(
             settings=settings,
@@ -108,8 +111,13 @@ class FireLensRuntime:
 def build_runtime(
     settings: Settings = default_settings,
     embedder_factory: EmbedderFactory | None = None,
+    mojo_backend: AccelerationBackend | None = None,
 ) -> FireLensRuntime:
-    return FireLensRuntime(settings=settings, embedder_factory=embedder_factory)
+    return FireLensRuntime(
+        settings=settings,
+        embedder_factory=embedder_factory,
+        mojo_backend=mojo_backend,
+    )
 
 
 def _shared_embedder_factory(
