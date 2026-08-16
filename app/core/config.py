@@ -78,6 +78,17 @@ class Settings(BaseSettings):
     embedding_dimension: int = Field(default=768, ge=1)
     embedding_batch_size: int = Field(default=32, ge=1)
     embedding_device: str | None = None
+    mojo_library_path: Path | None = None
+    mojo_fuzzy_min_candidates: int = Field(
+        default=4,
+        ge=1,
+        le=HARD_MAX_FUZZY_CANDIDATES,
+    )
+    mojo_semantic_min_candidates: int = Field(
+        default=30_000,
+        ge=1,
+        le=HARD_MAX_SEMANTIC_CANDIDATES,
+    )
     fuzzy_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     max_fuzzy_candidates: int = Field(
         default=512,
@@ -112,6 +123,15 @@ class Settings(BaseSettings):
     def normalize_data_dir(cls, value: Any) -> Path:
         """Expand and canonicalize the index data directory."""
 
+        return Path(value).expanduser().resolve()
+
+    @field_validator("mojo_library_path", mode="before")
+    @classmethod
+    def normalize_mojo_library_path(cls, value: Any) -> Path | None:
+        """Canonicalize an optional explicitly configured Mojo library."""
+
+        if value is None or value == "":
+            return None
         return Path(value).expanduser().resolve()
 
     @field_validator("embedding_provider", "embedding_model")

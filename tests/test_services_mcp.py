@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from app.acceleration.protocol import AccelerationError
+from app.acceleration.python_backend import PythonBackend
 from app.core.cancellation import OperationCancelledError
 from app.core.config import Settings
 from app.core.coordinator import RepositoryBusyError
@@ -47,6 +49,32 @@ class FailingFakeEmbedder(FakeEmbedder):
 
 class AlternateFakeEmbedder(FakeEmbedder):
     model = "alternate-fake"
+
+
+class RecordingMojoBackend(PythonBackend):
+    """Reference-compatible backend that records accelerated operations."""
+
+    name = "mojo"
+
+    def __init__(self) -> None:
+        self.fuzzy_call_count = 0
+        self.semantic_call_count = 0
+
+    def fuzzy_scores(self, query, candidates, minimum_score):
+        self.fuzzy_call_count += 1
+        return super().fuzzy_scores(query, candidates, minimum_score)
+
+    def semantic_top_k(self, matrix, query, top_k):
+        self.semantic_call_count += 1
+        return super().semantic_top_k(matrix, query, top_k)
+
+
+class FailingMojoBackend(RecordingMojoBackend):
+    def fuzzy_scores(self, query, candidates, minimum_score):
+        raise AccelerationError("simulated Mojo failure")
+
+    def semantic_top_k(self, matrix, query, top_k):
+        raise AccelerationError("simulated Mojo failure")
 
 
 class ServiceRuntimeTests(unittest.TestCase):
@@ -340,12 +368,199 @@ class ServiceRuntimeTests(unittest.TestCase):
             "def authenticate(user):\n"
             "    return user is not None\n",
         )
-        runtime = self._seed_index()
+        self._seed_index()
+        unavailable_settings = self.settings.model_copy(
+            update={"mojo_library_path": self.root / "missing-mojo-library"}
+        )
+        runtime = FireLensRuntime(
+            unavailable_settings,
+            embedder_factory=lambda: FakeEmbedder(dimension=8),
+        )
 
         with self.assertRaisesRegex(
             BackendUnavailableError,
             "Mojo backend is not available",
         ):
+            runtime.search_code(
+                self.repository,
+                "authenticate",
+                mode="exact",
+                backend="mojo",
+            )
+
+    def test_explicit_mojo_backend_executes_fuzzy_and_semantic_kernels(self) -> None:
+        self._write_source(
+            "service.py",
+            "def authenticate(user):\n"
+            "    return user is not None\n",
+        )
+        self._seed_index()
+        backend = RecordingMojoBackend()
+        runtime = FireLensRuntime(
+            self.settings,
+            embedder_factory=lambda: FakeEmbedder(dimension=8),
+            mojo_backend=backend,
+        )
+
+        fuzzy_response = runtime.search_code(
+            self.repository,
+            "authnticate",
+            mode="fuzzy",
+            backend="mojo",
+        )
+        semantic_response = runtime.search_code(
+            self.repository,
+            "where is authentication checked",
+            mode="semantic",
+            backend="mojo",
+        )
+
+        self.assertEqual(fuzzy_response.backend, "mojo")
+        self.assertEqual(semantic_response.backend, "mojo")
+        self.assertGreater(backend.fuzzy_call_count, 0)
+        self.assertGreater(backend.semantic_call_count, 0)
+
+    def test_automatic_mojo_failure_falls_back_to_python(self) -> None:
+        self._write_source(
+            "service.py",
+            "def authenticate(user):\n"
+            "    return user is not None\n",
+        )
+        self._seed_index()
+        runtime = FireLensRuntime(
+            self.settings.model_copy(update={"mojo_fuzzy_min_candidates": 1}),
+            embedder_factory=lambda: FakeEmbedder(dimension=8),
+            mojo_backend=FailingMojoBackend(),
+        )
+
+        response = runtime.search_code(
+            self.repository,
+            "authnticate",
+            mode="fuzzy",
+            backend="auto",
+        )
+
+        self.assertEqual(response.backend, "python")
+        self.assertIn(
+            "Mojo fuzzy acceleration failed; using Python",
+            response.warnings,
+        )
+
+    def test_automatic_semantic_mojo_failure_falls_back_to_python(self) -> None:
+        self._write_source(
+            "service.py",
+            "def authenticate(user):\n"
+            "    return user is not None\n",
+        )
+        self._seed_index()
+        accelerated_settings = self.settings.model_copy(
+            update={"mojo_semantic_min_candidates": 1}
+        )
+        runtime = FireLensRuntime(
+            accelerated_settings,
+            embedder_factory=lambda: FakeEmbedder(dimension=8),
+            mojo_backend=FailingMojoBackend(),
+        )
+
+        response = runtime.search_code(
+            self.repository,
+            "where is authentication checked",
+            mode="semantic",
+            backend="auto",
+        )
+
+        self.assertEqual(response.backend, "python")
+        self.assertIn(
+            "Mojo semantic acceleration failed; using Python",
+            response.warnings,
+        )
+
+    def test_automatic_backend_keeps_small_workloads_in_python(self) -> None:
+        self._write_source(
+            "service.py",
+            "def authenticate(user):\n"
+            "    return user is not None\n",
+        )
+        self._seed_index()
+        backend = RecordingMojoBackend()
+        runtime = FireLensRuntime(
+            self.settings,
+            embedder_factory=lambda: FakeEmbedder(dimension=8),
+            mojo_backend=backend,
+        )
+
+        fuzzy_response = runtime.search_code(
+            self.repository,
+            "authnticate",
+            mode="fuzzy",
+            backend="auto",
+        )
+        semantic_response = runtime.search_code(
+            self.repository,
+            "where is authentication checked",
+            mode="semantic",
+            backend="auto",
+        )
+
+        self.assertEqual(fuzzy_response.backend, "python")
+        self.assertEqual(semantic_response.backend, "python")
+        self.assertEqual(backend.fuzzy_call_count, 0)
+        self.assertEqual(backend.semantic_call_count, 0)
+
+    def test_automatic_backend_uses_configured_crossover_thresholds(self) -> None:
+        self._write_source(
+            "service.py",
+            "def authenticate(user):\n"
+            "    return user is not None\n",
+        )
+        self._seed_index()
+        backend = RecordingMojoBackend()
+        accelerated_settings = self.settings.model_copy(
+            update={
+                "mojo_fuzzy_min_candidates": 1,
+                "mojo_semantic_min_candidates": 1,
+            }
+        )
+        runtime = FireLensRuntime(
+            accelerated_settings,
+            embedder_factory=lambda: FakeEmbedder(dimension=8),
+            mojo_backend=backend,
+        )
+
+        fuzzy_response = runtime.search_code(
+            self.repository,
+            "authnticate",
+            mode="fuzzy",
+            backend="auto",
+        )
+        semantic_response = runtime.search_code(
+            self.repository,
+            "where is authentication checked",
+            mode="semantic",
+            backend="auto",
+        )
+
+        self.assertEqual(fuzzy_response.backend, "mojo")
+        self.assertEqual(semantic_response.backend, "mojo")
+        self.assertEqual(backend.fuzzy_call_count, 1)
+        self.assertEqual(backend.semantic_call_count, 1)
+
+    def test_explicit_mojo_exact_search_reports_benchmark_only_capability(
+        self,
+    ) -> None:
+        self._write_source(
+            "service.py",
+            "def authenticate(user):\n"
+            "    return user is not None\n",
+        )
+        self._seed_index()
+        runtime = FireLensRuntime(
+            self.settings,
+            embedder_factory=lambda: FakeEmbedder(dimension=8),
+            mojo_backend=RecordingMojoBackend(),
+        )
+
+        with self.assertRaisesRegex(BackendUnavailableError, "benchmark-only"):
             runtime.search_code(
                 self.repository,
                 "authenticate",

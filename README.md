@@ -3,11 +3,12 @@ Coding agents fail partly because they retrieve code that is textually similar b
 
 # 🔥 FireLens
 
-FireLens is a local-first code retrieval engine for Python repositories.
+FireLens is a retrieval and inference benchmark for AI coding agents, with hybrid code search, graph-aware retrieval, MCP integration, and Mojo-accelerated hot paths.
 
 It indexes repository symbols, semantic chunks, and embeddings into SQLite so
 code can be retrieved with exact, fuzzy, or natural-language semantic search.
 FireLens is not a chatbot. Retrieval and indexing are the product.
+
 
 ## Current scope
 
@@ -16,6 +17,7 @@ FireLens is not a chatbot. Retrieval and indexing are the product.
 - exact symbol-name search
 - fuzzy symbol-name search using normalized Levenshtein similarity
 - semantic code search using normalized vector similarity
+- optional Mojo CPU kernels for fuzzy scoring and large semantic rankings
 - exact-first automatic routing between all three search modes
 - local STDIO MCP tools for coding agents
 - JSON CLI for indexing, freshness checks, and search
@@ -33,6 +35,7 @@ FireLens is not a chatbot. Retrieval and indexing are the product.
 
 - Python `>=3.14,<3.15`
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- Mojo `1.0.0` only when building the optional acceleration library
 
 For real semantic embeddings, install project dependencies and provide a
 Hugging Face token in `.env` or the shell as `HF_TOKEN` if the model requires
@@ -56,6 +59,49 @@ their old dependencies only when maintaining that compatibility code:
 ```bash
 uv sync --extra legacy
 ```
+
+## Optional Mojo acceleration
+
+The default installation remains Python-only. To install the pinned Mojo
+compiler and build the optional CPU shared library:
+
+```bash
+uv sync --extra mojo
+uv run --extra mojo python scripts/build_mojo.py
+```
+
+The build is written atomically to `build/mojo/libfirelens_mojo.dylib` on
+macOS or `build/mojo/libfirelens_mojo.so` on Linux. FireLens discovers that
+path automatically. Set `FIRELENS_MOJO_LIBRARY_PATH` to load a library from a
+different path; its ABI version is checked before any kernel runs.
+
+Backend preferences behave as follows:
+
+- `auto` uses Mojo for fuzzy batches with at least four candidates and semantic
+  indexes with at least 30,000 rows, then falls back to Python if a native
+  operation fails.
+- `python` always uses the reference Python/NumPy compute path.
+- `mojo` requires the shared library and forces Mojo for fuzzy and semantic
+  compute, including below the automatic crossover sizes.
+- Exact search remains an indexed SQLite query. The native exact kernel is
+  available to benchmarks but is intentionally not in production routing; an
+  explicit `mojo` exact request reports that limitation instead of silently
+  changing backends.
+
+The automatic crossover sizes can be tuned with
+`FIRELENS_MOJO_FUZZY_MIN_CANDIDATES` and
+`FIRELENS_MOJO_SEMANTIC_MIN_CANDIDATES`. Benchmark the local machine before
+changing them:
+
+```bash
+uv run python -m benchmarks --profile full --comparison-backend mojo \
+  --output build/benchmarks/full.json \
+  --table-output build/benchmarks/full.md
+```
+
+See [the benchmark guide](benchmarks/README.md), the checked-in
+[CPU baseline](benchmarks/CPU_BASELINE.md), and the conditional
+[GPU gate](benchmarks/GPU_GATE.md) for the measurement and parity policy.
 
 ## Use the CLI
 
@@ -420,14 +466,15 @@ Semantic search:
 
 1. loads persisted chunk vectors and source metadata;
 2. embeds and normalizes the query;
-3. calculates cosine similarity with a NumPy matrix-vector product;
-4. sorts score indexes from highest to lowest;
+3. calculates cosine similarity with the selected Python or Mojo backend;
+4. selects stable top-k score indexes from highest to lowest;
 5. maps the selected indexes back to source chunks;
 6. returns the requested top-k results.
 
-Stored vectors are already normalized, so the query path does not perform
-separate full-matrix finite-value, zero-vector, or normalization passes. Raw
-cosine similarity is mapped from `-1–1` to the public `0–1` result-score range.
+Stored vectors are already normalized, so the query path does not renormalize
+the matrix. Each compute backend still validates its array boundary before
+ranking. Raw cosine similarity is mapped from `-1–1` to the public `0–1`
+result-score range.
 
 FireLens currently returns top-k semantic results without a minimum threshold.
 The displayed score is a ranking signal, not calibrated probability or
@@ -465,7 +512,7 @@ uv run python -m unittest discover -s tests -v
 
 - semantic-search quality evaluation and threshold calibration
 - module-level semantic chunks for imports, constants, and executable code
-- Mojo acceleration and Python/Mojo result parity tests
+- GPU semantic acceleration after a compatible toolchain passes the gate
 - Only Python repositories are parsed today.
 - `.gitignore` support is intentionally lightweight and limited to the root
   `.gitignore` file.

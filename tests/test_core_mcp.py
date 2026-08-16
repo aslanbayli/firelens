@@ -134,6 +134,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(configured.embedding_dimension, 768)
         self.assertEqual(configured.embedding_batch_size, 32)
         self.assertIsNone(configured.embedding_device)
+        self.assertIsNone(configured.mojo_library_path)
+        self.assertEqual(configured.mojo_fuzzy_min_candidates, 4)
+        self.assertEqual(configured.mojo_semantic_min_candidates, 30_000)
         self.assertEqual(configured.fuzzy_threshold, 0.55)
         self.assertEqual(configured.max_fuzzy_candidates, 512)
         self.assertEqual(configured.max_semantic_candidates, 50_000)
@@ -155,6 +158,9 @@ class SettingsTests(unittest.TestCase):
                 "FIRELENS_EMBEDDING_BATCH_SIZE": "16",
                 "FIRELENS_EMBEDDING_DEVICE": "cpu",
                 "FIRELENS_EMBEDDING_DIMENSION": "384",
+                "FIRELENS_MOJO_LIBRARY_PATH": str(Path(first) / "mojo.so"),
+                "FIRELENS_MOJO_FUZZY_MIN_CANDIDATES": "8",
+                "FIRELENS_MOJO_SEMANTIC_MIN_CANDIDATES": "20000",
             }
             with patch.dict(os.environ, environment, clear=True):
                 configured = Settings(_env_file=None)
@@ -167,6 +173,12 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(configured.embedding_batch_size, 16)
         self.assertEqual(configured.embedding_device, "cpu")
         self.assertEqual(configured.embedding_dimension, 384)
+        self.assertEqual(
+            configured.mojo_library_path,
+            (Path(first) / "mojo.so").resolve(),
+        )
+        self.assertEqual(configured.mojo_fuzzy_min_candidates, 8)
+        self.assertEqual(configured.mojo_semantic_min_candidates, 20_000)
 
     def test_installed_package_data_default_is_outside_the_package(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -216,7 +228,9 @@ class SettingsTests(unittest.TestCase):
             {"default_max_snippet_chars": 3_000, "max_snippet_chars": 2_000},
             {"max_total_snippet_chars": 12_001},
             {"max_fuzzy_candidates": 513},
+            {"mojo_fuzzy_min_candidates": 513},
             {"max_semantic_candidates": 50_001},
+            {"mojo_semantic_min_candidates": 50_001},
             {"max_semantic_index_bytes": 256 * 1024 * 1024 + 1},
             {"max_chunks_per_file": 4_097},
         ]

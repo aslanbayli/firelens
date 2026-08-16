@@ -7,6 +7,9 @@ from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
+from app.acceleration.mojo_backend import MojoBackend
+from app.acceleration.protocol import AccelerationBackend, CapabilityName
+from app.acceleration.python_backend import PythonBackend
 from app.core.cancellation import CancellationCallback, raise_if_cancelled
 from app.core.config import Settings, settings as default_settings
 from app.core.coordinator import RepositoryBusyError, RepositoryCoordinator
@@ -55,11 +58,20 @@ class SearchService:
         resolver: RepositoryResolver | None = None,
         coordinator: RepositoryCoordinator | None = None,
         embedder_factory: EmbedderFactory | None = None,
+        mojo_backend: AccelerationBackend | None = None,
     ) -> None:
         self.settings = settings
         self.resolver = resolver or RepositoryResolver(settings)
         self.coordinator = coordinator or RepositoryCoordinator()
         self._embedder_factory = embedder_factory or self._create_default_embedder
+        self._python_backend = PythonBackend()
+        if mojo_backend is None:
+            self._mojo_backend, self._mojo_unavailable_reason = (
+                MojoBackend.try_create(settings.mojo_library_path)
+            )
+        else:
+            self._mojo_backend = mojo_backend
+            self._mojo_unavailable_reason = None
         self._embedder: Embedder | None = None
         self._embedder_lock = threading.Lock()
         self._cache_lock = threading.Lock()
@@ -160,6 +172,7 @@ class SearchService:
                 cancellation_callback,
             )
         elif request.request_mode == "exact":
+            self._select_compute_backend(request, "exact")
             response = exact_search(
                 store,
                 repository.id,
@@ -167,6 +180,7 @@ class SearchService:
                 cancellation_callback=cancellation_callback,
             )
         elif request.request_mode == "fuzzy":
+            backend = self._select_compute_backend(request, "fuzzy")
             response = fuzzy_search(
                 store,
                 repository.id,
@@ -174,6 +188,13 @@ class SearchService:
                 minimum_score=self.settings.fuzzy_threshold,
                 max_candidates=self.settings.max_fuzzy_candidates,
                 cancellation_callback=cancellation_callback,
+                backend=backend,
+                fallback_backend=(
+                    self._python_backend if request.backend == "auto" else None
+                ),
+                minimum_accelerated_candidates=(
+                    self.settings.mojo_fuzzy_min_candidates
+                ),
             )
         else:
             response = self._semantic_search(
@@ -230,12 +251,14 @@ class SearchService:
             cancellation_callback=cancellation_callback,
         )
         if exact_response.ranked_results:
+            self._select_compute_backend(request, "exact")
             return exact_response
 
         routed_mode = classify_non_exact_query(request.query)
         fuzzy_limit_exceeded = False
         if routed_mode == "fuzzy":
             try:
+                backend = self._select_compute_backend(request, "fuzzy")
                 fuzzy_response = fuzzy_search(
                     store,
                     repository_id,
@@ -243,6 +266,15 @@ class SearchService:
                     minimum_score=self.settings.fuzzy_threshold,
                     max_candidates=self.settings.max_fuzzy_candidates,
                     cancellation_callback=cancellation_callback,
+                    backend=backend,
+                    fallback_backend=(
+                        self._python_backend
+                        if request.backend == "auto"
+                        else None
+                    ),
+                    minimum_accelerated_candidates=(
+                        self.settings.mojo_fuzzy_min_candidates
+                    ),
                 )
             except SearchCandidateLimitError:
                 fuzzy_response = None
@@ -288,6 +320,11 @@ class SearchService:
             raise_if_cancelled(cancellation_callback)
             embedder = self._get_embedder(cancellation_callback)
             raise_if_cancelled(cancellation_callback)
+            backend = self._select_compute_backend(
+                request,
+                "semantic",
+                candidate_count=len(search_index.candidates),
+            )
             return semantic_search(
                 store,
                 repository_id,
@@ -295,6 +332,10 @@ class SearchService:
                 embedder,
                 search_index=search_index,
                 cancellation_callback=cancellation_callback,
+                backend=backend,
+                fallback_backend=(
+                    self._python_backend if request.backend == "auto" else None
+                ),
             )
         finally:
             self._release_semantic_index(cache_key)
@@ -524,15 +565,58 @@ class SearchService:
                 f"{self.settings.max_snippet_chars}"
             )
 
-    @staticmethod
-    def _select_backend(request: SearchRequest) -> list[str]:
-        if request.backend == "mojo":
+    def _select_backend(self, request: SearchRequest) -> list[str]:
+        if request.backend == "mojo" and self._mojo_backend is None:
             raise BackendUnavailableError(
-                "The Mojo backend is not available in this FireLens build"
+                "The Mojo backend is not available: "
+                f"{self._mojo_unavailable_reason or 'unknown reason'}"
             )
-        if request.backend == "auto":
+        if request.backend == "auto" and self._mojo_backend is None:
             return ["Mojo backend unavailable; using Python"]
         return []
+
+    def _select_compute_backend(
+        self,
+        request: SearchRequest,
+        capability: CapabilityName,
+        *,
+        candidate_count: int | None = None,
+    ) -> AccelerationBackend:
+        """Resolve one pure-compute operation after query routing."""
+
+        if request.backend == "python":
+            return self._python_backend
+
+        mojo_backend = self._mojo_backend
+        runtime_capability_enabled = capability in {"fuzzy", "semantic"}
+        auto_size_gate_passed = (
+            request.backend != "auto"
+            or capability != "semantic"
+            or (
+                candidate_count is not None
+                and candidate_count
+                >= self.settings.mojo_semantic_min_candidates
+            )
+        )
+        if (
+            mojo_backend is not None
+            and runtime_capability_enabled
+            and auto_size_gate_passed
+            and mojo_backend.supports(capability)
+        ):
+            return mojo_backend
+
+        if request.backend == "mojo":
+            if capability == "exact":
+                reason = (
+                    "Mojo exact matching is benchmark-only; indexed SQLite "
+                    "remains the production exact-search backend"
+                )
+            else:
+                reason = f"Mojo does not support {capability} search"
+            raise BackendUnavailableError(reason)
+
+        return self._python_backend
 
     def _bound_snippets(
         self,
