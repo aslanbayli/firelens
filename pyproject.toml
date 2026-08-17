@@ -1,9 +1,28 @@
 [project]
 name = "firelens"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local-first hybrid code retrieval for coding agents"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
+license = "MIT"
+authors = [
+    { name = "Ali Aslanbayli" },
+]
+keywords = [
+    "code-search",
+    "mcp",
+    "retrieval",
+    "semantic-search",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+]
 dependencies = [
     "einops>=0.8.2",
     "mcp>=2,<3",
@@ -27,6 +46,12 @@ legacy = [
 [project.scripts]
 firelens = "app.interfaces.cli:main"
 firelens-mcp = "app.interfaces.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/aslanbayli/firelens"
+Repository = "https://github.com/aslanbayli/firelens.git"
+Issues = "https://github.com/aslanbayli/firelens/issues"
+Changelog = "https://github.com/aslanbayli/firelens/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["setuptools>=77"]

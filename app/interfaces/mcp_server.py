@@ -11,6 +11,7 @@ from mcp.server.mcpserver import Context
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from app import __version__
 from app.core.cancellation import CancellationCallback
 from app.core.models import (
     IndexRepositoryResponse,
@@ -239,7 +240,7 @@ def create_mcp_server(runtime: FireLensRuntime | None = None) -> MCPServer:
     services = runtime or build_runtime()
     server = MCPServer(
         "firelens",
-        version="0.1.0",
+        version=__version__,
         instructions=SERVER_INSTRUCTIONS,
     )
 

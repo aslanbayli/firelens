@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import tempfile
+import tomllib
 import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
@@ -12,6 +13,7 @@ from typing import Any
 from mcp import StdioServerParameters, stdio_client
 from mcp.client import Client
 
+from app import __version__
 from app.core.models import (
     IndexRepositoryResponse,
     IndexStatusResponse,
@@ -28,6 +30,15 @@ from app.interfaces.mcp_server import create_mcp_server
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class VersionContractTests(unittest.TestCase):
+    def test_runtime_version_matches_project_metadata(self) -> None:
+        project_data = tomllib.loads(
+            (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(__version__, project_data["project"]["version"])
 
 
 class _FakeRuntime:
