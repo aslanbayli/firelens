@@ -33,6 +33,8 @@ class IndexedFile:
     size_bytes: int
     content_hash: str
     language: str = "python"
+    source_text: str = ""
+    line_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -82,7 +84,7 @@ class StoredGraphNeighbor:
 
 @dataclass(frozen=True)
 class StoredGraphResult:
-    """A graph node mapped to one retrievable symbol or chunk record."""
+    """A graph node mapped to one retrievable symbol or file record."""
 
     node_id: uuid.UUID
     record_id: uuid.UUID
@@ -176,7 +178,18 @@ class StoredLexicalCandidate:
     start_line: int
     end_line: int
     snippet: str
+    symbol_id: uuid.UUID | None = None
     raw_bm25_rank: float | None = None
+
+
+@dataclass(frozen=True)
+class StoredFileSource:
+    """One indexed source-file snapshot used for complete result context."""
+
+    relative_path: str
+    language: str
+    line_count: int
+    source_text: str
 
 
 @dataclass(frozen=True)
@@ -259,6 +272,8 @@ class SQLiteIndexStore:
                     size_bytes INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
                     language TEXT NOT NULL DEFAULT 'python',
+                    source_text TEXT NOT NULL DEFAULT '',
+                    line_count INTEGER NOT NULL DEFAULT 1,
                     UNIQUE(repository_id, relative_path),
                     FOREIGN KEY(repository_id)
                         REFERENCES repositories(id)
@@ -461,6 +476,18 @@ class SQLiteIndexStore:
                 "files",
                 "language",
                 "TEXT NOT NULL DEFAULT 'python'",
+            )
+            self._ensure_column(
+                connection,
+                "files",
+                "source_text",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "files",
+                "line_count",
+                "INTEGER NOT NULL DEFAULT 1",
             )
             self._ensure_column(
                 connection,
@@ -981,6 +1008,51 @@ class SQLiteIndexStore:
             for row in rows
         }
 
+    def load_file_sources_by_paths(
+        self,
+        repository_id: uuid.UUID,
+        relative_paths: Iterable[str],
+        *,
+        max_snippet_chars: int,
+    ) -> dict[str, StoredFileSource]:
+        """Load bounded source snapshots for a small set of ranked files."""
+
+        if max_snippet_chars < 1:
+            raise ValueError("max_snippet_chars must be greater than 0")
+        unique_paths = list(dict.fromkeys(relative_paths))
+        if not unique_paths:
+            return {}
+
+        placeholders = ", ".join("?" for _ in unique_paths)
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    relative_path,
+                    language,
+                    line_count,
+                    substr(source_text, 1, ?) AS source_text
+                FROM files
+                WHERE repository_id = ?
+                    AND relative_path IN ({placeholders})
+                """,
+                [
+                    max_snippet_chars + 1,
+                    str(repository_id),
+                    *unique_paths,
+                ],
+            ).fetchall()
+
+        return {
+            row["relative_path"]: StoredFileSource(
+                relative_path=row["relative_path"],
+                language=row["language"],
+                line_count=row["line_count"],
+                source_text=row["source_text"],
+            )
+            for row in rows
+        }
+
     def load_graph_nodes(self, repository_id: uuid.UUID) -> list[GraphNode]:
         """Load all graph nodes for deterministic repository-wide resolution."""
 
@@ -1310,39 +1382,25 @@ class SQLiteIndexStore:
                 result = _graph_result_from_row(row)
                 results[result.node_id] = result
 
-            chunk_rows = connection.execute(
+            file_rows = connection.execute(
                 f"""
                 SELECT
                     n.id AS node_id,
-                    c.id AS record_id,
-                    'chunk' AS result_type,
-                    c.semantic_unit_kind,
-                    c.language,
-                    c.relative_path,
-                    s.name,
-                    s.qualified_name,
-                    c.start_line,
-                    c.end_line,
-                    substr(c.raw_text, 1, ?) AS snippet,
-                    c.symbol_id
+                    n.id AS record_id,
+                    'file' AS result_type,
+                    NULL AS semantic_unit_kind,
+                    f.language,
+                    f.relative_path,
+                    NULL AS name,
+                    NULL AS qualified_name,
+                    1 AS start_line,
+                    f.line_count AS end_line,
+                    substr(f.source_text, 1, ?) AS snippet,
+                    NULL AS symbol_id
                 FROM graph_nodes AS n
-                JOIN chunks AS c ON c.id = (
-                    SELECT candidate.id
-                    FROM chunks AS candidate
-                    WHERE candidate.repository_id = n.repository_id
-                        AND candidate.relative_path = n.relative_path
-                    ORDER BY
-                        CASE candidate.semantic_unit_kind
-                            WHEN 'imports' THEN 0
-                            WHEN 'module_code' THEN 1
-                            ELSE 2
-                        END,
-                        candidate.start_line,
-                        candidate.end_line,
-                        candidate.id
-                    LIMIT 1
-                )
-                LEFT JOIN symbols AS s ON s.id = c.symbol_id
+                JOIN files AS f
+                    ON f.repository_id = n.repository_id
+                    AND f.relative_path = n.relative_path
                 WHERE n.repository_id = ?
                     AND n.id IN ({placeholders})
                     AND n.symbol_id IS NULL
@@ -1351,7 +1409,7 @@ class SQLiteIndexStore:
                 """,
                 common_parameters,
             ).fetchall()
-            for row in chunk_rows:
+            for row in file_rows:
                 result = _graph_result_from_row(row)
                 results[result.node_id] = result
         return results
@@ -1439,7 +1497,8 @@ class SQLiteIndexStore:
                     qualified_name,
                     start_line,
                     end_line,
-                    substr(snippet, 1, ?) AS snippet
+                    substr(snippet, 1, ?) AS snippet,
+                    record_id AS symbol_id
                 FROM lexical_documents
                 WHERE repository_id = ?
                     AND result_type = 'symbol'
@@ -1498,29 +1557,40 @@ class SQLiteIndexStore:
             rows = connection.execute(
                 f"""
                 SELECT
-                    record_id,
-                    result_type,
-                    semantic_unit_kind,
-                    language,
-                    relative_path,
-                    name,
-                    qualified_name,
-                    start_line,
-                    end_line,
-                    substr(snippet, 1, ?) AS snippet
+                    lexical_documents.record_id,
+                    lexical_documents.result_type,
+                    lexical_documents.semantic_unit_kind,
+                    lexical_documents.language,
+                    lexical_documents.relative_path,
+                    lexical_documents.name,
+                    lexical_documents.qualified_name,
+                    lexical_documents.start_line,
+                    lexical_documents.end_line,
+                    substr(lexical_documents.snippet, 1, ?) AS snippet,
+                    CASE
+                        WHEN lexical_documents.result_type = 'symbol'
+                            THEN lexical_documents.record_id
+                        ELSE matched_chunk.symbol_id
+                    END AS symbol_id
                 FROM lexical_documents
-                WHERE repository_id = ?
+                LEFT JOIN chunks AS matched_chunk
+                    ON lexical_documents.result_type = 'chunk'
+                    AND matched_chunk.id = lexical_documents.record_id
+                WHERE lexical_documents.repository_id = ?
                     AND (
-                        relative_path = ?
-                        OR relative_path LIKE ? ESCAPE '\\'
+                        lexical_documents.relative_path = ?
+                        OR lexical_documents.relative_path LIKE ? ESCAPE '\\'
                     )
                     {path_clause}
                 ORDER BY
-                    CASE WHEN relative_path = ? THEN 0 ELSE 1 END,
-                    length(relative_path),
-                    relative_path,
-                    start_line,
-                    record_id
+                    CASE
+                        WHEN lexical_documents.relative_path = ? THEN 0
+                        ELSE 1
+                    END,
+                    length(lexical_documents.relative_path),
+                    lexical_documents.relative_path,
+                    lexical_documents.start_line,
+                    lexical_documents.record_id
                 LIMIT ?
                 """,
                 parameters,
@@ -1570,6 +1640,11 @@ class SQLiteIndexStore:
                     lexical_documents.start_line,
                     lexical_documents.end_line,
                     substr(lexical_documents.snippet, 1, ?) AS snippet,
+                    CASE
+                        WHEN lexical_documents.result_type = 'symbol'
+                            THEN lexical_documents.record_id
+                        ELSE matched_chunk.symbol_id
+                    END AS symbol_id,
                     bm25(
                         lexical_documents_fts,
                         ?, ?, ?, ?, ?
@@ -1577,6 +1652,9 @@ class SQLiteIndexStore:
                 FROM lexical_documents_fts
                 INNER JOIN lexical_documents
                     ON lexical_documents.rowid = lexical_documents_fts.rowid
+                LEFT JOIN chunks AS matched_chunk
+                    ON lexical_documents.result_type = 'chunk'
+                    AND matched_chunk.id = lexical_documents.record_id
                 WHERE lexical_documents_fts MATCH ?
                     AND lexical_documents.repository_id = ?
                     {path_clause}
@@ -2118,9 +2196,11 @@ class SQLiteIndexStore:
                 modified_time_ns,
                 size_bytes,
                 content_hash,
-                language
+                language,
+                source_text,
+                line_count
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -2130,6 +2210,8 @@ class SQLiteIndexStore:
                     file.size_bytes,
                     file.content_hash,
                     file.language,
+                    file.source_text,
+                    file.line_count,
                 )
                 for file in files
             ],
@@ -2575,6 +2657,11 @@ def _lexical_candidate_from_row(row: sqlite3.Row) -> StoredLexicalCandidate:
         start_line=row["start_line"],
         end_line=row["end_line"],
         snippet=row["snippet"],
+        symbol_id=(
+            uuid.UUID(row["symbol_id"])
+            if "symbol_id" in keys and row["symbol_id"]
+            else None
+        ),
         raw_bm25_rank=(
             float(row["raw_bm25_rank"])
             if "raw_bm25_rank" in keys

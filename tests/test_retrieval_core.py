@@ -237,9 +237,13 @@ class RetrievalCoreIntegrationTests(unittest.TestCase):
             "symbol_comment",
             {result.semantic_unit_kind for result in ordinary.ranked_results},
         )
-        self.assertIn(
-            "symbol_comment",
-            {result.semantic_unit_kind for result in comments.ranked_results},
+        self.assertTrue(
+            any(
+                result.result_type == "symbol"
+                and "def authenticateUser" in result.snippet
+                and "return bool(user)" in result.snippet
+                for result in comments.ranked_results
+            )
         )
 
     def test_lexical_search_hides_imports_unless_requested(self) -> None:
@@ -268,13 +272,23 @@ class RetrievalCoreIntegrationTests(unittest.TestCase):
         )
 
     def test_filename_terms_do_not_surface_import_or_comment_fragments(self) -> None:
-        (self.repository / "fuzzy_search.py").write_text(
+        function_source = (
+            "def run_fuzzy_search(query):\n"
+            "    score = 0\n"
+            + "".join(
+                f"    score += {index}\n"
+                for index in range(250)
+            )
+            + "    return score, query\n"
+        )
+        source = (
             "# Fuzzy search implementation notes.\n"
             "from app.search.fuzzy import fuzzy_search\n\n"
-            "def fuzzy_search_candidates(query):\n"
-            "    return fuzzy_search(query)\n",
-            encoding="utf-8",
+            "FUZZY_SEARCH_LIMIT = 512\n\n"
+            + function_source
         )
+        self.assertGreater(len(function_source), 2_000)
+        (self.repository / "fuzzy_search.py").write_text(source, encoding="utf-8")
         self.runtime.index_repository(self.repository)
 
         response = self.runtime.search_code(
@@ -284,17 +298,33 @@ class RetrievalCoreIntegrationTests(unittest.TestCase):
             top_k=20,
         )
 
-        self.assertTrue(
-            any(
-                result.result_type == "symbol"
-                and result.file_path == "fuzzy_search.py"
+        symbol_result = next(
+            result
+            for result in response.ranked_results
+            if result.result_type == "symbol"
+            and result.symbol_name == "run_fuzzy_search"
+        )
+        file_result = next(
+            result
+            for result in response.ranked_results
+            if result.result_type == "file"
+            and result.file_path == "fuzzy_search.py"
+        )
+
+        self.assertEqual(symbol_result.snippet, function_source)
+        self.assertEqual(file_result.snippet, source)
+        self.assertFalse(symbol_result.snippet_truncated)
+        self.assertFalse(file_result.snippet_truncated)
+        self.assertEqual(
+            sum(
+                result.symbol_name == "run_fuzzy_search"
                 for result in response.ranked_results
-            )
+            ),
+            1,
         )
         self.assertTrue(
             all(
-                result.semantic_unit_kind
-                not in {"imports", "module_comment", "symbol_comment"}
+                result.result_type in {"symbol", "file"}
                 for result in response.ranked_results
             )
         )

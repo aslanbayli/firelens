@@ -17,10 +17,19 @@ _COMMENT_TERMS = {
     "commenting",
     "comments",
 }
+_DOCUMENTATION_TERMS = {
+    "doc",
+    "docs",
+    "docstring",
+    "docstrings",
+    "documentation",
+    "readme",
+}
 _REQUIRED_INTENT_TERMS = {
     "imports": _IMPORT_TERMS,
     "module_comment": _COMMENT_TERMS,
     "symbol_comment": _COMMENT_TERMS,
+    "module_docstring": _DOCUMENTATION_TERMS,
 }
 
 

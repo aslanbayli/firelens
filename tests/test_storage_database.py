@@ -200,6 +200,11 @@ class SQLiteIndexStoreTests(unittest.TestCase):
                 [chunks[0].id],
                 max_chars=4_000,
             )
+            file_sources = store.load_file_sources_by_paths(
+                repository.id,
+                ["example.py"],
+                max_snippet_chars=4_000,
+            )
             semantic_index = load_semantic_search_index(
                 store,
                 repository.id,
@@ -224,6 +229,11 @@ class SQLiteIndexStoreTests(unittest.TestCase):
         self.assertEqual(summary.vector_bytes, repository.embedding_dim * 4)
         self.assertEqual(semantic_rows[0].candidate.chunk_id, chunks[0].id)
         self.assertEqual(chunk_texts[chunks[0].id], chunks[0].raw_text)
+        self.assertEqual(
+            file_sources["example.py"].source_text,
+            files[0].source_text,
+        )
+        self.assertEqual(file_sources["example.py"].line_count, 2)
         self.assertEqual(semantic_index.matrix.shape, (1, repository.embedding_dim))
 
 
@@ -254,6 +264,8 @@ def _sample_index() -> tuple[
             modified_time_ns=10,
             size_bytes=20,
             content_hash="abc",
+            source_text="def hello():\n    return 'world'\n",
+            line_count=2,
         )
     ]
     symbols = [

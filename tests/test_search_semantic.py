@@ -7,7 +7,7 @@ import numpy as np
 from app.acceleration.python_backend import PythonBackend
 from app.core.models import Repository, SearchRequest, Symbol
 from app.search.semantic import SemanticSearchIndex, semantic_search
-from app.storage.database import StoredSemanticCandidate
+from app.storage.database import StoredFileSource, StoredSemanticCandidate
 
 
 REPOSITORY_ID = uuid.UUID("00000000-0000-0000-0000-000000000100")
@@ -36,19 +36,19 @@ class SemanticStore:
     def __init__(
         self,
         symbols: list[Symbol],
-        chunk_texts: dict[uuid.UUID, str],
+        file_texts: dict[str, str],
     ) -> None:
         self.repository = Repository(
             id=REPOSITORY_ID,
             absolute_path="/repository",
-            index_format_version="3",
+            index_format_version="4",
             timestamp_of_index=1,
             embedding_provider=ControlledEmbedder.provider,
             embedding_model=ControlledEmbedder.model,
             embedding_dim=ControlledEmbedder.dimension,
         )
         self.symbols = {symbol.id: symbol for symbol in symbols}
-        self.chunk_texts = chunk_texts
+        self.file_texts = file_texts
 
     def load_repository(self, repository_id: uuid.UUID) -> Repository | None:
         return self.repository if repository_id == self.repository.id else None
@@ -70,15 +70,25 @@ class SemanticStore:
             for symbol_id in dict.fromkeys(symbol_ids)
         }
 
-    def load_chunk_texts(
+    def load_file_sources_by_paths(
         self,
-        chunk_ids,
+        repository_id: uuid.UUID,
+        relative_paths,
         *,
-        max_chars: int,
-    ) -> dict[uuid.UUID, str]:
+        max_snippet_chars: int,
+    ) -> dict[str, StoredFileSource]:
+        if repository_id != self.repository.id:
+            return {}
         return {
-            chunk_id: self.chunk_texts[chunk_id][: max_chars + 1]
-            for chunk_id in dict.fromkeys(chunk_ids)
+            relative_path: StoredFileSource(
+                relative_path=relative_path,
+                language="python",
+                line_count=max(1, len(self.file_texts[relative_path].splitlines())),
+                source_text=self.file_texts[relative_path][
+                    : max_snippet_chars + 1
+                ],
+            )
+            for relative_path in dict.fromkeys(relative_paths)
         }
 
 
@@ -147,19 +157,34 @@ class SemanticResultContextTests(unittest.TestCase):
 
     def test_low_signal_fragments_require_explicit_query_intent(self) -> None:
         candidates = [
-            _candidate(1, kind="imports", start_line=1),
-            _candidate(2, kind="module_comment", start_line=5),
-            _candidate(3, kind="module_code", start_line=10),
-            _candidate(4, kind="documentation", start_line=20),
+            _candidate(1, kind="imports", start_line=1, relative_path="imports.py"),
+            _candidate(
+                2,
+                kind="module_comment",
+                start_line=5,
+                relative_path="comments.py",
+            ),
+            _candidate(
+                3,
+                kind="module_code",
+                start_line=10,
+                relative_path="module.py",
+            ),
+            _candidate(
+                4,
+                kind="documentation",
+                start_line=20,
+                relative_path="README.md",
+            ),
         ]
         similarities = [0.90, 0.89, 0.86, 0.85]
-        chunk_texts = {
-            candidate.chunk_id: f"{candidate.semantic_unit_kind} content\n"
+        file_texts = {
+            candidate.relative_path: f"{candidate.semantic_unit_kind} content\n"
             for candidate in candidates
         }
 
         response = semantic_search(
-            SemanticStore([], chunk_texts),
+            SemanticStore([], file_texts),
             REPOSITORY_ID,
             SearchRequest(query="implementation logic", request_mode="semantic", top_k=2),
             ControlledEmbedder(),
@@ -171,9 +196,12 @@ class SemanticResultContextTests(unittest.TestCase):
             [result.semantic_unit_kind for result in response.ranked_results],
             ["module_code", "documentation"],
         )
-        self.assertGreater(
-            response.ranked_results[0].score,
-            response.ranked_results[1].score,
+        self.assertTrue(
+            all(result.result_type == "file" for result in response.ranked_results)
+        )
+        self.assertEqual(
+            response.ranked_results[0].snippet,
+            file_texts["module.py"],
         )
 
     def test_import_and_comment_queries_can_return_matching_fragments(self) -> None:
@@ -181,12 +209,12 @@ class SemanticResultContextTests(unittest.TestCase):
             _candidate(1, kind="imports", start_line=1),
             _candidate(2, kind="module_comment", start_line=5),
         ]
-        chunk_texts = {
-            candidate.chunk_id: f"{candidate.semantic_unit_kind} content\n"
+        file_texts = {
+            candidate.relative_path: f"{candidate.semantic_unit_kind} content\n"
             for candidate in candidates
         }
         search_index = _search_index(candidates, [0.90, 0.89])
-        store = SemanticStore([], chunk_texts)
+        store = SemanticStore([], file_texts)
 
         imports_response = semantic_search(
             store,
@@ -216,7 +244,7 @@ class SemanticResultContextTests(unittest.TestCase):
         candidate = _candidate(1, kind="imports", start_line=1)
 
         response = semantic_search(
-            SemanticStore([], {candidate.chunk_id: "import package\n"}),
+            SemanticStore([], {candidate.relative_path: "import package\n"}),
             REPOSITORY_ID,
             SearchRequest(query="important behavior", request_mode="semantic"),
             ControlledEmbedder(),
@@ -253,10 +281,11 @@ def _candidate(
     kind: str,
     start_line: int,
     symbol: Symbol | None = None,
+    relative_path: str = "module.py",
 ) -> StoredSemanticCandidate:
     return StoredSemanticCandidate(
         chunk_id=uuid.UUID(int=1_000 + identifier),
-        relative_path=symbol.relative_path if symbol is not None else "module.py",
+        relative_path=symbol.relative_path if symbol is not None else relative_path,
         start_line=start_line,
         end_line=start_line,
         symbol_id=symbol.id if symbol is not None else None,

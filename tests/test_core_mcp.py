@@ -38,7 +38,7 @@ class SearchContractTests(unittest.TestCase):
         self.assertEqual(request.request_mode, "auto")
         self.assertEqual(request.top_k, 5)
         self.assertEqual(request.backend, "auto")
-        self.assertEqual(request.max_snippet_chars, 2_000)
+        self.assertEqual(request.max_snippet_chars, 12_000)
 
     def test_search_request_rejects_empty_query_and_out_of_range_limits(self) -> None:
         invalid_requests = [
@@ -47,7 +47,7 @@ class SearchContractTests(unittest.TestCase):
             {"query": "valid", "top_k": 21},
             {"query": "x" * 2_001},
             {"query": "valid", "max_snippet_chars": 0},
-            {"query": "valid", "max_snippet_chars": 4_001},
+            {"query": "valid", "max_snippet_chars": 32_001},
         ]
 
         for arguments in invalid_requests:
@@ -143,9 +143,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(configured.max_semantic_index_bytes, 192 * 1024 * 1024)
         self.assertEqual(configured.max_chunks_per_file, 2_048)
         self.assertEqual(configured.max_top_k, 20)
-        self.assertEqual(configured.default_max_snippet_chars, 2_000)
-        self.assertEqual(configured.max_snippet_chars, 4_000)
-        self.assertEqual(configured.max_total_snippet_chars, 12_000)
+        self.assertEqual(configured.default_max_snippet_chars, 12_000)
+        self.assertEqual(configured.max_snippet_chars, 32_000)
+        self.assertEqual(configured.max_total_snippet_chars, 64_000)
 
     def test_allowed_roots_use_the_platform_path_separator(self) -> None:
         with (
@@ -225,8 +225,8 @@ class SettingsTests(unittest.TestCase):
         invalid_settings = [
             {"embedding_dimension": 0},
             {"max_top_k": 4},
-            {"default_max_snippet_chars": 3_000, "max_snippet_chars": 2_000},
-            {"max_total_snippet_chars": 12_001},
+            {"default_max_snippet_chars": 20_000, "max_snippet_chars": 12_000},
+            {"max_total_snippet_chars": 64_001},
             {"max_fuzzy_candidates": 513},
             {"mojo_fuzzy_min_candidates": 513},
             {"max_semantic_candidates": 50_001},

@@ -209,9 +209,9 @@ class Settings(BaseSettings):
     max_repository_files: int = Field(default=10_000, ge=1)
     max_walk_entries: int = Field(default=100_000, ge=1)
     max_top_k: int = Field(default=20, ge=5, le=20)
-    default_max_snippet_chars: int = Field(default=2_000, ge=1, le=4_000)
-    max_snippet_chars: int = Field(default=4_000, ge=2_000, le=4_000)
-    max_total_snippet_chars: int = Field(default=12_000, ge=1, le=12_000)
+    default_max_snippet_chars: int = Field(default=12_000, ge=1, le=32_000)
+    max_snippet_chars: int = Field(default=32_000, ge=12_000, le=32_000)
+    max_total_snippet_chars: int = Field(default=64_000, ge=1, le=64_000)
 
     @field_validator("data_dir", mode="before")
     @classmethod

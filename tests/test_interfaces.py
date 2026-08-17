@@ -313,7 +313,7 @@ class McpInMemoryContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(search_input["query"]["maxLength"], 2_000)
         self.assertEqual(search_input["top_k"]["maximum"], 20)
-        self.assertEqual(search_input["max_snippet_chars"]["maximum"], 4_000)
+        self.assertEqual(search_input["max_snippet_chars"]["maximum"], 32_000)
 
     async def test_status_and_search_return_structured_content(self) -> None:
         async with Client(self.server) as client:
@@ -346,7 +346,7 @@ class McpInMemoryContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.runtime.status_calls, ["/repo"])
         self.assertEqual(self.runtime.search_calls[0]["top_k"], 5)
-        self.assertEqual(self.runtime.search_calls[0]["max_snippet_chars"], 2_000)
+        self.assertEqual(self.runtime.search_calls[0]["max_snippet_chars"], 12_000)
 
     async def test_index_returns_structured_content_and_reports_progress(self) -> None:
         progress_events: list[tuple[float, float | None, str | None]] = []

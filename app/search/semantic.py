@@ -30,7 +30,7 @@ class SemanticSearchIndex:
 
 _PYTHON_BACKEND = PythonBackend()
 
-SEMANTIC_RANKING_VERSION = "context-v2"
+SEMANTIC_RANKING_VERSION = "complete-context-v3"
 
 # Semantic chunks are intentionally fine-grained so comments and docstrings can
 # support symbol context or targeted searches. Ranking more matches than the
@@ -343,14 +343,15 @@ def semantic_search(
         selected_symbol_ids,
         max_snippet_chars=request.max_snippet_chars,
     )
-    selected_chunk_ids = [
-        match.candidate.chunk_id
+    selected_file_paths = [
+        match.candidate.relative_path
         for match in selected_matches
         if match.candidate.symbol_id is None
     ]
-    chunk_texts = store.load_chunk_texts(
-        selected_chunk_ids,
-        max_chars=request.max_snippet_chars,
+    files_by_path = store.load_file_sources_by_paths(
+        repository_id,
+        selected_file_paths,
+        max_snippet_chars=request.max_snippet_chars,
     )
     raise_if_cancelled(cancellation_callback)
 
@@ -388,21 +389,20 @@ def semantic_search(
                 ],
             )
         else:
-            raw_text = chunk_texts.get(candidate.chunk_id)
-            if raw_text is None:
-                raise ValueError("Ranked semantic chunk was not found")
-            snippet = raw_text[: request.max_snippet_chars]
+            source_file = files_by_path.get(candidate.relative_path)
+            if source_file is None:
+                raise ValueError("Ranked semantic file was not found")
+            snippet = source_file.source_text[: request.max_snippet_chars]
             result = SearchResult(
-                id=candidate.chunk_id,
-                result_type="chunk",
-                file_path=candidate.relative_path,
-                start_line=candidate.start_line,
-                end_line=candidate.end_line,
-                symbol_name=bounded_symbol_name(candidate.qualified_symbol_name),
-                language=candidate.language,
+                id=_file_result_id(repository_id, candidate.relative_path),
+                result_type="file",
+                file_path=source_file.relative_path,
+                start_line=1,
+                end_line=source_file.line_count,
+                language=source_file.language,
                 semantic_unit_kind=candidate.semantic_unit_kind,
                 snippet=snippet,
-                snippet_truncated=len(snippet) < len(raw_text),
+                snippet_truncated=len(snippet) < len(source_file.source_text),
                 score=match.relevance_score,
                 mode="semantic",
                 backend=active_backend.name,
@@ -482,9 +482,9 @@ def _select_semantic_matches(
     result_limit: int,
     score_floor: float | None,
 ) -> list[_RankedSemanticMatch]:
-    """Drop unrequested fragments and collapse symbol-owned evidence."""
+    """Drop unrequested fragments and collapse matches by source entity."""
 
-    best_by_identity: dict[tuple[str, uuid.UUID], _RankedSemanticMatch] = {}
+    best_by_identity: dict[tuple[str, str], _RankedSemanticMatch] = {}
     for match in matches:
         if (
             match.candidate.symbol_id is None
@@ -511,10 +511,16 @@ def _select_semantic_matches(
 
 def _semantic_match_identity(
     candidate: StoredSemanticCandidate,
-) -> tuple[str, uuid.UUID]:
+) -> tuple[str, str]:
     if candidate.symbol_id is not None:
-        return "symbol", candidate.symbol_id
-    return "chunk", candidate.chunk_id
+        return "symbol", str(candidate.symbol_id)
+    return "file", candidate.relative_path
+
+
+def _file_result_id(repository_id: uuid.UUID, relative_path: str) -> uuid.UUID:
+    """Return a stable public identity for one indexed file result."""
+
+    return uuid.uuid5(repository_id, f"file:{relative_path}")
 
 
 def _semantic_match_sort_key(
