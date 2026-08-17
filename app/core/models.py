@@ -11,23 +11,19 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-SymbolKind = Literal[
-    # A regular function declared outside a class.
-    "function",
-    # An async function declared outside a class.
-    "async_function",
-    # A Python class declaration.
-    "class",
-    # A regular function whose immediate lexical parent is a class.
-    "method",
-    # An async function whose immediate lexical parent is a class.
-    "async_method",
+SymbolKind = Annotated[
+    str,
+    Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$"),
+]
+SemanticUnitKind = Annotated[
+    str,
+    Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$"),
 ]
 
 # ``RetrievalKind`` is the mode that actually produced a result. ``auto`` is
 # only a caller preference, so it belongs to ``RetrievalMode`` instead.
-RetrievalKind = Literal["exact", "fuzzy", "semantic"]
-RetrievalMode = Literal["exact", "fuzzy", "semantic", "auto"]
+RetrievalKind = Literal["exact", "fuzzy", "lexical", "semantic"]
+RetrievalMode = Literal["exact", "fuzzy", "lexical", "semantic", "auto"]
 BackendKind = Literal["python", "mojo"]
 BackendPreference = Literal["auto", "python", "mojo"]
 IndexStatus = Literal["missing", "ready", "stale", "indexing"]
@@ -82,6 +78,8 @@ class Symbol(BaseModel):
     end_line: int
     # Exact source slice covering the complete declaration.
     source_snippet: str
+    # String-valued adapter language ID, such as ``python``.
+    language: str = "python"
 
 
 class Chunk(BaseModel):
@@ -105,6 +103,18 @@ class Chunk(BaseModel):
     # SHA-256 of the final text sent to the embedder. Matching hashes allow a
     # future incremental indexer to reuse an existing embedding.
     content_hash: str
+    # Language adapter that produced this semantic unit.
+    language: str = "python"
+    # Extensible semantic role such as symbol, imports, or documentation.
+    semantic_unit_kind: SemanticUnitKind = "symbol"
+
+
+class RetrievalEvidence(BaseModel):
+    """Public, normalized evidence contributed by one retrieval channel."""
+
+    channel: Annotated[str, Field(min_length=1, max_length=64)]
+    score: float = Field(ge=0.0, le=1.0)
+    rank: int = Field(ge=1)
 
 
 class SearchRequest(BaseModel):
@@ -149,6 +159,8 @@ class SearchResult(BaseModel):
     symbol_name: Annotated[str, Field(max_length=4_096)] | None = None
     # Source language used by renderers and coding agents.
     language: str = "python"
+    # Present for semantic-unit results and absent for standalone symbols.
+    semantic_unit_kind: SemanticUnitKind | None = None
     # Bounded source text included with the result.
     snippet: Annotated[str, Field(max_length=4_000)]
     # True when the source text was shortened to satisfy an output limit.
@@ -159,6 +171,13 @@ class SearchResult(BaseModel):
     mode: RetrievalKind
     # Compute implementation that actually performed the relevant operation.
     backend: BackendKind
+    # Ordered names of all channels that contributed to the public score.
+    retrieval_channels: list[str] = Field(default_factory=list, max_length=16)
+    # Per-channel rank and normalized score evidence.
+    retrieval_evidence: list[RetrievalEvidence] = Field(
+        default_factory=list,
+        max_length=16,
+    )
 
 
 class SearchResponse(BaseModel):
@@ -178,6 +197,8 @@ class SearchResponse(BaseModel):
     ranked_results: list[SearchResult] = Field(max_length=20)
     # Non-fatal details such as falling back from Mojo to Python.
     warnings: list[str] = Field(default_factory=list)
+    # Stable name and hash for the effective retrieval calibration settings.
+    retrieval_config: Annotated[str, Field(min_length=1, max_length=128)] = "default"
 
 
 class IndexingErrorResponse(BaseModel):
@@ -203,6 +224,7 @@ class IndexRepositoryResponse(BaseModel):
     symbol_count: int = Field(default=0, ge=0)
     chunk_count: int = Field(default=0, ge=0)
     embedding_count: int = Field(default=0, ge=0)
+    lexical_document_count: int = Field(default=0, ge=0)
     added_file_count: int = Field(default=0, ge=0)
     changed_file_count: int = Field(default=0, ge=0)
     deleted_file_count: int = Field(default=0, ge=0)
@@ -230,6 +252,7 @@ class IndexStatusResponse(BaseModel):
     symbol_count: int = Field(default=0, ge=0)
     chunk_count: int = Field(default=0, ge=0)
     embedding_count: int = Field(default=0, ge=0)
+    lexical_document_count: int = Field(default=0, ge=0)
     added_file_count: int = Field(default=0, ge=0)
     changed_file_count: int = Field(default=0, ge=0)
     deleted_file_count: int = Field(default=0, ge=0)

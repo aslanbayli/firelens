@@ -48,6 +48,7 @@ HARD_MAX_FUZZY_CANDIDATES = 512
 HARD_MAX_SEMANTIC_CANDIDATES = 50_000
 HARD_MAX_SEMANTIC_INDEX_BYTES = 256 * 1024 * 1024
 HARD_MAX_CHUNKS_PER_FILE = 4_096
+HARD_MAX_LEXICAL_CANDIDATES = 5_000
 
 
 class Settings(BaseSettings):
@@ -90,6 +91,37 @@ class Settings(BaseSettings):
         le=HARD_MAX_SEMANTIC_CANDIDATES,
     )
     fuzzy_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
+    retrieval_config_name: str = Field(default="default", min_length=1, max_length=64)
+    lexical_exact_qualified_bonus: float = Field(default=1.0, ge=0.0, le=1.0)
+    lexical_exact_short_bonus: float = Field(default=0.96, ge=0.0, le=1.0)
+    lexical_path_bonus: float = Field(default=0.86, ge=0.0, le=1.0)
+    lexical_identifier_bonus: float = Field(default=0.76, ge=0.0, le=1.0)
+    lexical_bm25_bonus: float = Field(default=0.66, ge=0.0, le=1.0)
+    lexical_fuzzy_bonus: float = Field(default=0.36, ge=0.0, le=1.0)
+    lexical_exact_candidate_limit: int = Field(
+        default=50, ge=1, le=HARD_MAX_LEXICAL_CANDIDATES
+    )
+    lexical_path_candidate_limit: int = Field(
+        default=50, ge=1, le=HARD_MAX_LEXICAL_CANDIDATES
+    )
+    lexical_identifier_candidate_limit: int = Field(
+        default=100, ge=1, le=HARD_MAX_LEXICAL_CANDIDATES
+    )
+    lexical_bm25_candidate_limit: int = Field(
+        default=100, ge=1, le=HARD_MAX_LEXICAL_CANDIDATES
+    )
+    lexical_fuzzy_candidate_limit: int = Field(
+        default=512, ge=1, le=HARD_MAX_LEXICAL_CANDIDATES
+    )
+    max_lexical_documents_ranked: int = Field(
+        default=500, ge=1, le=HARD_MAX_LEXICAL_CANDIDATES
+    )
+    bm25_name_weight: float = Field(default=8.0, ge=0.0)
+    bm25_qualified_name_weight: float = Field(default=6.0, ge=0.0)
+    bm25_identifier_weight: float = Field(default=4.0, ge=0.0)
+    bm25_path_weight: float = Field(default=2.0, ge=0.0)
+    bm25_content_weight: float = Field(default=1.0, ge=0.0)
+    semantic_score_floor: float | None = Field(default=None, ge=0.0, le=1.0)
     max_fuzzy_candidates: int = Field(
         default=512,
         ge=1,

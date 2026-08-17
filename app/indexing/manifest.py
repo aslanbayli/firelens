@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.cancellation import CancellationCallback, raise_if_cancelled
+from app.indexing.adapters import (
+    DEFAULT_ADAPTER_REGISTRY,
+    LanguageAdapterRegistry,
+)
 from app.indexing.file_io import read_regular_file
 from app.indexing.walker import walk
 from app.storage.database import IndexedFile
@@ -39,6 +43,7 @@ def build_file_manifest(
     max_files: int = 10_000,
     max_entries: int = 100_000,
     cancellation_callback: CancellationCallback | None = None,
+    adapter_registry: LanguageAdapterRegistry = DEFAULT_ADAPTER_REGISTRY,
 ) -> dict[str, IndexedFile]:
     """Hash every supported source file in deterministic path order."""
 
@@ -55,6 +60,7 @@ def build_file_manifest(
             max_files=max_files,
             max_entries=max_entries,
             cancellation_callback=cancellation_callback,
+            adapter_registry=adapter_registry,
         )
     )
     if len(paths) > max_files:
@@ -83,6 +89,7 @@ def build_file_manifest(
             modified_time_ns=stat.st_mtime_ns,
             size_bytes=stat.st_size,
             content_hash=hashlib.sha256(contents).hexdigest(),
+            language=adapter_registry.require_adapter(relative_path).language,
         )
 
     return records

@@ -10,6 +10,10 @@ import hashlib
 import uuid
 
 from app.core.models import Chunk, Symbol
+from app.indexing.analysis import (
+    SemanticUnit,
+    SourceFile,
+)
 
 
 def build_embedding_text(
@@ -22,23 +26,23 @@ def build_embedding_text(
     qualified_name: str | None = None,
     # Kind gives additional semantic context such as class versus method.
     kind: str | None = None,
+    language: str = "python",
 ) -> str:
     """Construct the exact text that will be converted into an embedding."""
 
-    metadata = [f"File: {relative_path}"]
-
-    # Module-level chunks will have no symbol name, so append this conditionally.
+    source_file = SourceFile(
+        relative_path=relative_path,
+        language=language,
+        text=raw_text,
+    )
+    metadata = [
+        f"Language: {source_file.language}",
+        f"Path: {source_file.relative_path}",
+        f"Kind: {kind or 'symbol'}",
+    ]
     if qualified_name is not None:
         metadata.append(f"Symbol: {qualified_name}")
-
-    # Kind is meaningful only for symbol-owned chunks.
-    if kind is not None:
-        metadata.append(f"Kind: {kind}")
-
-    # Join metadata with single newlines, add a blank separator, then preserve
-    # the original source unchanged. This format must remain deterministic
-    # because the same text is later hashed for embedding reuse.
-    return "\n".join(metadata) + "\n\n" + raw_text
+    return "\n".join([*metadata, raw_text])
 
 
 def calculate_content_hash(text: str) -> str:
@@ -96,6 +100,149 @@ def _line_windows(
     return windows
 
 
+def subtract_owned_spans(
+    start_line: int,
+    end_line: int,
+    owned_spans: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return inclusive gaps after subtracting merged owned source spans."""
+
+    if start_line < 1 or end_line < start_line:
+        raise ValueError("source range must be one-based and inclusive")
+
+    clipped = sorted(
+        (max(start_line, start), min(end_line, end))
+        for start, end in owned_spans
+        if end >= start_line and start <= end_line and end >= start
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in clipped:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    gaps: list[tuple[int, int]] = []
+    cursor = start_line
+    for start, end in merged:
+        if cursor < start:
+            gaps.append((cursor, start - 1))
+        cursor = max(cursor, end + 1)
+    if cursor <= end_line:
+        gaps.append((cursor, end_line))
+    return gaps
+
+
+def group_spans_with_windows(
+    spans: list[tuple[int, int]],
+    max_lines: int = 100,
+    overlap: int = 20,
+) -> list[tuple[int, int]]:
+    """Merge adjacent spans and split them into deterministic line windows."""
+
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        if start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return [
+        window
+        for start, end in merged
+        for window in _line_windows(start, end, max_lines, overlap)
+    ]
+
+
+def chunk_semantic_units(
+    source_file: SourceFile,
+    semantic_units: tuple[SemanticUnit, ...] | list[SemanticUnit],
+    repository_id: uuid.UUID,
+    symbols_by_qualified_name: dict[str, Symbol],
+    max_lines: int = 100,
+    overlap: int = 20,
+    max_chunks: int = 2_048,
+) -> list[Chunk]:
+    """Convert neutral semantic units into persisted, bounded chunks."""
+
+    if max_chunks < 1:
+        raise ValueError("max_chunks must be positive")
+    source_lines = source_file.text.splitlines(keepends=True)
+    chunks: list[Chunk] = []
+    seen: set[tuple[str, int, int, uuid.UUID | None, str]] = set()
+
+    for unit in semantic_units:
+        unit_lines = unit.text.splitlines(keepends=True)
+        unit_line_count = unit.end_line - unit.start_line + 1
+        persisted_symbol = (
+            symbols_by_qualified_name.get(unit.symbol.qualified_name)
+            if unit.symbol is not None
+            else None
+        )
+        for start_line, end_line in _line_windows(
+            unit.start_line,
+            unit.end_line,
+            max_lines,
+            overlap,
+        ):
+            if len(unit_lines) == unit_line_count:
+                relative_start = start_line - unit.start_line
+                relative_end = end_line - unit.start_line + 1
+                raw_text = "".join(unit_lines[relative_start:relative_end])
+            else:
+                raw_text = "".join(source_lines[start_line - 1 : end_line])
+            if not raw_text.strip():
+                continue
+            key = (
+                unit.kind,
+                start_line,
+                end_line,
+                persisted_symbol.id if persisted_symbol is not None else None,
+                raw_text,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(chunks) >= max_chunks:
+                raise ValueError(
+                    f"File exceeds the {max_chunks} semantic chunk limit"
+                )
+
+            embedding_text = build_embedding_text(
+                relative_path=source_file.relative_path,
+                raw_text=raw_text,
+                qualified_name=(
+                    persisted_symbol.qualified_name
+                    if persisted_symbol is not None
+                    else None
+                ),
+                kind=unit.kind,
+                language=source_file.language,
+            )
+            chunks.append(
+                Chunk(
+                    id=uuid.uuid5(
+                        repository_id,
+                        f"{unit.stable_id_input}:{start_line}:{end_line}",
+                    ),
+                    repository_id=repository_id,
+                    relative_path=source_file.relative_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    symbol_id=(
+                        persisted_symbol.id if persisted_symbol is not None else None
+                    ),
+                    raw_text=raw_text,
+                    content_hash=calculate_content_hash(embedding_text),
+                    language=source_file.language,
+                    semantic_unit_kind=unit.kind,
+                )
+            )
+    return chunks
+
+
 def chunk_symbols(
     # Complete file source is needed because symbol lines refer to file-level
     # coordinates rather than offsets inside each snippet.
@@ -145,6 +292,7 @@ def chunk_symbols(
                 raw_text=raw_text,
                 qualified_name=symbol.qualified_name,
                 kind=symbol.kind,
+                language=symbol.language,
             )
 
             # Construct a validated Chunk model and append it in one operation.
@@ -165,11 +313,10 @@ def chunk_symbols(
                     raw_text=raw_text,
                     # Hash the enriched embedding input, not only raw code.
                     content_hash=calculate_content_hash(embedding_text),
+                    language=symbol.language,
+                    semantic_unit_kind="symbol",
                 )
             )
-
-    # TODO: Add chunks for imports, constants, module docstrings, and
-    # executable module-level statements outside top-level symbol ranges.
 
     # TODO: Consider token-based limits after line-based chunking is tested.
 

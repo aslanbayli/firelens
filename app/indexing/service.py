@@ -27,6 +27,7 @@ from app.indexing.indexer import (
     raise_if_indexing_cancelled,
 )
 from app.indexing.manifest import build_file_manifest, compare_file_manifests
+from app.indexing.version import INDEX_FORMAT_VERSION
 from app.storage.database import SQLiteIndexStore
 from app.storage.locking import (
     DatabaseLockBusyError,
@@ -35,7 +36,6 @@ from app.storage.locking import (
 )
 
 
-INDEX_FORMAT_VERSION = "1"
 MAX_STATUS_PATHS = 20
 MAX_INDEX_ERRORS = 20
 
@@ -53,6 +53,8 @@ class AvailableIndex:
     embedding_provider: str
     embedding_model: str
     embedding_dim: int
+    index_format_version: str = INDEX_FORMAT_VERSION
+    status: IndexStatus = "ready"
 
 
 class IndexService:
@@ -82,9 +84,7 @@ class IndexService:
             store = SQLiteIndexStore(database_path)
             try:
                 with shared_database_lock(database_path, blocking=False):
-                    repositories = store.list_repositories(
-                        index_format_version=INDEX_FORMAT_VERSION,
-                    )
+                    repositories = store.list_repositories()
             except DatabaseLockBusyError:
                 continue
 
@@ -125,6 +125,12 @@ class IndexService:
                     embedding_provider=repository.embedding_provider,
                     embedding_model=repository.embedding_model,
                     embedding_dim=repository.embedding_dim,
+                    index_format_version=repository.index_format_version,
+                    status=(
+                        "ready"
+                        if repository.index_format_version == INDEX_FORMAT_VERSION
+                        else "stale"
+                    ),
                 )
             )
 
@@ -222,6 +228,7 @@ class IndexService:
             symbol_count=report.symbol_count,
             chunk_count=report.chunk_count,
             embedding_count=report.embedding_count,
+            lexical_document_count=report.lexical_document_count,
             added_file_count=report.added_file_count,
             changed_file_count=report.changed_file_count,
             deleted_file_count=report.deleted_file_count,
@@ -281,7 +288,26 @@ class IndexService:
             index_format_version=INDEX_FORMAT_VERSION,
         )
         if repository is None:
-            return self._missing_status(resolved, is_indexing=False)
+            stale_repository = store.load_latest_repository(
+                absolute_path=str(resolved.root)
+            )
+            if stale_repository is None:
+                return self._missing_status(resolved, is_indexing=False)
+            counts = _load_counts(
+                store,
+                stale_repository,
+                cancellation_callback,
+                include_lexical=False,
+            )
+            return self._status_response(
+                resolved,
+                stale_repository,
+                status="stale",
+                counts=counts,
+                warnings=[
+                    "Index format is outdated and requires a complete rebuild"
+                ],
+            )
 
         raise_if_cancelled(cancellation_callback)
         counts = _load_counts(store, repository, cancellation_callback)
@@ -408,6 +434,7 @@ class IndexService:
             symbol_count=counts["symbols"],
             chunk_count=counts["chunks"],
             embedding_count=counts["embeddings"],
+            lexical_document_count=counts.get("lexical_documents", 0),
             added_file_count=added_file_count,
             changed_file_count=changed_file_count,
             deleted_file_count=deleted_file_count,
@@ -435,9 +462,13 @@ def _load_counts(
     store: SQLiteIndexStore,
     repository: Repository,
     cancellation_callback: CancellationCallback | None = None,
+    include_lexical: bool = True,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for table in ("files", "symbols", "chunks", "embeddings"):
+    tables = ["files", "symbols", "chunks", "embeddings"]
+    if include_lexical:
+        tables.append("lexical_documents")
+    for table in tables:
         raise_if_cancelled(cancellation_callback)
         counts[table] = store.count_rows(table, repository.id)
     return counts

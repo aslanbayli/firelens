@@ -6,12 +6,13 @@ queries directly.
 """
 
 import hashlib
+import math
 import re
 import sqlite3
 import uuid
 from array import array
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
@@ -31,6 +32,27 @@ class IndexedFile:
     modified_time_ns: int
     size_bytes: int
     content_hash: str
+    language: str = "python"
+
+
+@dataclass(frozen=True)
+class LexicalDocument:
+    """A denormalized retrievable record owned by the storage layer."""
+
+    document_id: str
+    repository_id: uuid.UUID
+    record_id: uuid.UUID
+    result_type: str
+    semantic_unit_kind: str | None
+    language: str
+    relative_path: str
+    name: str | None
+    qualified_name: str | None
+    identifier_terms: str
+    content: str
+    start_line: int
+    end_line: int
+    snippet: str
 
 
 @dataclass(frozen=True)
@@ -41,6 +63,7 @@ class IndexedFileRecords:
     symbols: list[Symbol]
     chunks: list[Chunk]
     embeddings: list[list[float]]
+    lexical_documents: list[LexicalDocument] = field(default_factory=list)
 
 
 def default_database_path(
@@ -102,6 +125,25 @@ class StoredSemanticCandidate:
     start_line: int
     end_line: int
     qualified_symbol_name: str | None = None
+    language: str = "python"
+    semantic_unit_kind: str = "symbol"
+
+
+@dataclass(frozen=True)
+class StoredLexicalCandidate:
+    """A lexical result reconstructed entirely by the storage layer."""
+
+    record_id: uuid.UUID
+    result_type: str
+    semantic_unit_kind: str | None
+    language: str
+    relative_path: str
+    name: str | None
+    qualified_name: str | None
+    start_line: int
+    end_line: int
+    snippet: str
+    raw_bm25_rank: float | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +225,7 @@ class SQLiteIndexStore:
                     modified_time_ns INTEGER NOT NULL,
                     size_bytes INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
+                    language TEXT NOT NULL DEFAULT 'python',
                     UNIQUE(repository_id, relative_path),
                     FOREIGN KEY(repository_id)
                         REFERENCES repositories(id)
@@ -199,6 +242,7 @@ class SQLiteIndexStore:
                     start_line INTEGER NOT NULL,
                     end_line INTEGER NOT NULL,
                     source_snippet TEXT NOT NULL,
+                    language TEXT NOT NULL DEFAULT 'python',
                     FOREIGN KEY(repository_id)
                         REFERENCES repositories(id)
                         ON DELETE CASCADE
@@ -213,6 +257,8 @@ class SQLiteIndexStore:
                     symbol_id TEXT,
                     raw_text TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
+                    language TEXT NOT NULL DEFAULT 'python',
+                    semantic_unit_kind TEXT NOT NULL DEFAULT 'symbol',
                     FOREIGN KEY(repository_id)
                         REFERENCES repositories(id)
                         ON DELETE CASCADE,
@@ -235,6 +281,26 @@ class SQLiteIndexStore:
                         ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS lexical_documents (
+                    document_id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    result_type TEXT NOT NULL,
+                    semantic_unit_kind TEXT,
+                    language TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    name TEXT,
+                    qualified_name TEXT,
+                    identifier_terms TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    snippet TEXT NOT NULL,
+                    FOREIGN KEY(repository_id)
+                        REFERENCES repositories(id)
+                        ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_symbols_name
                     ON symbols(repository_id, name);
                 CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
@@ -249,6 +315,12 @@ class SQLiteIndexStore:
                     ON chunks(repository_id, content_hash);
                 CREATE INDEX IF NOT EXISTS idx_embeddings_repo_model
                     ON embeddings(repository_id, model);
+                CREATE INDEX IF NOT EXISTS idx_lexical_documents_repository
+                    ON lexical_documents(repository_id);
+                CREATE INDEX IF NOT EXISTS idx_lexical_documents_names
+                    ON lexical_documents(repository_id, qualified_name, name);
+                CREATE INDEX IF NOT EXISTS idx_lexical_documents_path
+                    ON lexical_documents(repository_id, relative_path);
                 """
             )
             repository_columns = {
@@ -260,6 +332,110 @@ class SQLiteIndexStore:
                     "ALTER TABLE repositories "
                     "ADD COLUMN embedding_provider TEXT NOT NULL DEFAULT 'unknown'"
                 )
+            self._ensure_column(
+                connection,
+                "files",
+                "language",
+                "TEXT NOT NULL DEFAULT 'python'",
+            )
+            self._ensure_column(
+                connection,
+                "symbols",
+                "language",
+                "TEXT NOT NULL DEFAULT 'python'",
+            )
+            self._ensure_column(
+                connection,
+                "chunks",
+                "language",
+                "TEXT NOT NULL DEFAULT 'python'",
+            )
+            self._ensure_column(
+                connection,
+                "chunks",
+                "semantic_unit_kind",
+                "TEXT NOT NULL DEFAULT 'symbol'",
+            )
+            try:
+                connection.executescript(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS lexical_documents_fts
+                    USING fts5(
+                        name,
+                        qualified_name,
+                        identifier_terms,
+                        relative_path,
+                        content,
+                        tokenize = 'unicode61'
+                    );
+
+                    CREATE TRIGGER IF NOT EXISTS lexical_documents_after_insert
+                    AFTER INSERT ON lexical_documents BEGIN
+                        INSERT INTO lexical_documents_fts (
+                            rowid,
+                            name,
+                            qualified_name,
+                            identifier_terms,
+                            relative_path,
+                            content
+                        ) VALUES (
+                            new.rowid,
+                            new.name,
+                            new.qualified_name,
+                            new.identifier_terms,
+                            new.relative_path,
+                            new.content
+                        );
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS lexical_documents_after_delete
+                    AFTER DELETE ON lexical_documents BEGIN
+                        DELETE FROM lexical_documents_fts WHERE rowid = old.rowid;
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS lexical_documents_after_update
+                    AFTER UPDATE ON lexical_documents BEGIN
+                        DELETE FROM lexical_documents_fts WHERE rowid = old.rowid;
+                        INSERT INTO lexical_documents_fts (
+                            rowid,
+                            name,
+                            qualified_name,
+                            identifier_terms,
+                            relative_path,
+                            content
+                        ) VALUES (
+                            new.rowid,
+                            new.name,
+                            new.qualified_name,
+                            new.identifier_terms,
+                            new.relative_path,
+                            new.content
+                        );
+                    END;
+                    """
+                )
+                connection.execute(
+                    "SELECT rowid FROM lexical_documents_fts LIMIT 1"
+                ).fetchone()
+            except sqlite3.OperationalError as error:
+                raise RuntimeError(
+                    "FireLens requires a Python SQLite build with FTS5 support"
+                ) from error
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        declaration: str,
+    ) -> None:
+        columns = {
+            row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+            )
 
     def backup_to(self, destination: str | Path) -> None:
         """Create a consistent SQLite snapshot at ``destination``."""
@@ -306,6 +482,7 @@ class SQLiteIndexStore:
         symbols: list[Symbol],
         chunks: list[Chunk],
         embeddings: list[list[float]],
+        lexical_documents: list[LexicalDocument] | None = None,
     ) -> None:
         """Replace all persisted records for a repository in one transaction."""
 
@@ -336,10 +513,15 @@ class SQLiteIndexStore:
                 "DELETE FROM files WHERE repository_id = ?",
                 (repository_id,),
             )
+            connection.execute(
+                "DELETE FROM lexical_documents WHERE repository_id = ?",
+                (repository_id,),
+            )
             self._insert_files(connection, files)
             self._insert_symbols(connection, symbols)
             self._insert_chunks(connection, chunks)
             self._insert_embeddings(connection, repository, chunks, embeddings)
+            self._insert_lexical_documents(connection, lexical_documents or [])
 
     def apply_file_updates(
         self,
@@ -380,11 +562,21 @@ class SQLiteIndexStore:
                     file_records.chunks,
                     file_records.embeddings,
                 )
+                self._insert_lexical_documents(
+                    connection,
+                    file_records.lexical_documents,
+                )
 
     def count_rows(self, table: str, repository_id: uuid.UUID) -> int:
         """Return a repository-scoped row count for tests and diagnostics."""
 
-        allowed_tables = {"files", "symbols", "chunks", "embeddings"}
+        allowed_tables = {
+            "files",
+            "symbols",
+            "chunks",
+            "embeddings",
+            "lexical_documents",
+        }
         if table not in allowed_tables:
             raise ValueError(f"Unsupported table: {table}")
 
@@ -605,7 +797,8 @@ class SQLiteIndexStore:
                     relative_path,
                     modified_time_ns,
                     size_bytes,
-                    content_hash
+                    content_hash,
+                    language
                 FROM files
                 WHERE repository_id = ?
                 """,
@@ -619,6 +812,7 @@ class SQLiteIndexStore:
                 modified_time_ns=row["modified_time_ns"],
                 size_bytes=row["size_bytes"],
                 content_hash=row["content_hash"],
+                language=row["language"],
             )
             for row in rows
         }
@@ -671,6 +865,200 @@ class SQLiteIndexStore:
                 seen_ids.add(symbol.id)
 
         return matches[:limit]
+
+    def exact_lexical_candidates(
+        self,
+        repository_id: uuid.UUID,
+        query: str,
+        path_filter: str | None,
+        *,
+        limit: int,
+        max_snippet_chars: int,
+    ) -> list[StoredLexicalCandidate]:
+        """Load exact qualified and short symbol-name candidates."""
+
+        _validate_lexical_limits(limit, max_snippet_chars)
+
+        path_parameters: list[str] = []
+        path_clause = ""
+        if path_filter is not None:
+            path_clause, path_parameters = _path_filter_clause(
+                "lexical_documents.relative_path",
+                path_filter,
+            )
+
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    record_id,
+                    result_type,
+                    semantic_unit_kind,
+                    language,
+                    relative_path,
+                    name,
+                    qualified_name,
+                    start_line,
+                    end_line,
+                    substr(snippet, 1, ?) AS snippet
+                FROM lexical_documents
+                WHERE repository_id = ?
+                    AND result_type = 'symbol'
+                    AND (qualified_name = ? OR name = ?)
+                    {path_clause}
+                ORDER BY
+                    CASE WHEN qualified_name = ? THEN 0 ELSE 1 END,
+                    relative_path,
+                    qualified_name,
+                    start_line,
+                    record_id
+                LIMIT ?
+                """,
+                [
+                    max_snippet_chars + 1,
+                    str(repository_id),
+                    query,
+                    query,
+                    *path_parameters,
+                    query,
+                    limit,
+                ],
+            ).fetchall()
+        return [_lexical_candidate_from_row(row) for row in rows]
+
+    def path_lexical_candidates(
+        self,
+        repository_id: uuid.UUID,
+        query_path: str,
+        path_filter: str | None,
+        *,
+        limit: int,
+        max_snippet_chars: int,
+    ) -> list[StoredLexicalCandidate]:
+        """Load exact or prefix path candidates in deterministic order."""
+
+        _validate_lexical_limits(limit, max_snippet_chars)
+
+        escaped_path = _escape_like(query_path)
+        parameters: list[str | int] = [
+            max_snippet_chars + 1,
+            str(repository_id),
+            query_path,
+            f"{escaped_path}%",
+        ]
+        path_clause = ""
+        if path_filter is not None:
+            path_clause, path_parameters = _path_filter_clause(
+                "lexical_documents.relative_path",
+                path_filter,
+            )
+            parameters.extend(path_parameters)
+        parameters.extend([query_path, limit])
+
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    record_id,
+                    result_type,
+                    semantic_unit_kind,
+                    language,
+                    relative_path,
+                    name,
+                    qualified_name,
+                    start_line,
+                    end_line,
+                    substr(snippet, 1, ?) AS snippet
+                FROM lexical_documents
+                WHERE repository_id = ?
+                    AND (
+                        relative_path = ?
+                        OR relative_path LIKE ? ESCAPE '\\'
+                    )
+                    {path_clause}
+                ORDER BY
+                    CASE WHEN relative_path = ? THEN 0 ELSE 1 END,
+                    length(relative_path),
+                    relative_path,
+                    start_line,
+                    record_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [_lexical_candidate_from_row(row) for row in rows]
+
+    def fts_lexical_candidates(
+        self,
+        repository_id: uuid.UUID,
+        fts_query: str,
+        path_filter: str | None,
+        *,
+        limit: int,
+        max_snippet_chars: int,
+        field_weights: tuple[float, float, float, float, float],
+    ) -> list[StoredLexicalCandidate]:
+        """Rank a safely constructed FTS5 expression with BM25."""
+
+        if not fts_query:
+            return []
+        _validate_lexical_limits(limit, max_snippet_chars)
+        if len(field_weights) != 5 or any(
+            not math.isfinite(weight) or weight < 0.0 for weight in field_weights
+        ):
+            raise ValueError(
+                "BM25 field weights must be five finite nonnegative values"
+            )
+        path_parameters: list[str] = []
+        path_clause = ""
+        if path_filter is not None:
+            path_clause, path_parameters = _path_filter_clause(
+                "lexical_documents.relative_path",
+                path_filter,
+            )
+
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    lexical_documents.record_id,
+                    lexical_documents.result_type,
+                    lexical_documents.semantic_unit_kind,
+                    lexical_documents.language,
+                    lexical_documents.relative_path,
+                    lexical_documents.name,
+                    lexical_documents.qualified_name,
+                    lexical_documents.start_line,
+                    lexical_documents.end_line,
+                    substr(lexical_documents.snippet, 1, ?) AS snippet,
+                    bm25(
+                        lexical_documents_fts,
+                        ?, ?, ?, ?, ?
+                    ) AS raw_bm25_rank
+                FROM lexical_documents_fts
+                INNER JOIN lexical_documents
+                    ON lexical_documents.rowid = lexical_documents_fts.rowid
+                WHERE lexical_documents_fts MATCH ?
+                    AND lexical_documents.repository_id = ?
+                    {path_clause}
+                ORDER BY
+                    raw_bm25_rank,
+                    lexical_documents.relative_path,
+                    lexical_documents.start_line,
+                    lexical_documents.end_line,
+                    lexical_documents.record_id
+                LIMIT ?
+                """,
+                [
+                    max_snippet_chars + 1,
+                    *field_weights,
+                    fts_query,
+                    str(repository_id),
+                    *path_parameters,
+                    limit,
+                ],
+            ).fetchall()
+        return [_lexical_candidate_from_row(row) for row in rows]
 
     def load_symbol_candidates(
         self,
@@ -772,7 +1160,8 @@ class SQLiteIndexStore:
                     relative_path,
                     start_line,
                     end_line,
-                    substr(source_snippet, 1, ?) AS source_snippet
+                    substr(source_snippet, 1, ?) AS source_snippet,
+                    language
                 FROM symbols
                 WHERE id IN ({placeholders})
                 """,
@@ -810,7 +1199,8 @@ class SQLiteIndexStore:
                     relative_path,
                     start_line,
                     end_line,
-                    source_snippet
+                    source_snippet,
+                    language
                 FROM symbols
                 WHERE repository_id = ?
                     {path_clause}
@@ -908,6 +1298,8 @@ class SQLiteIndexStore:
                     chunks.relative_path,
                     chunks.start_line,
                     chunks.end_line,
+                    chunks.language,
+                    chunks.semantic_unit_kind,
                     embeddings.vector AS embedding_vector,
                     substr(symbols.qualified_name, 1, 4096)
                         AS qualified_symbol_name
@@ -934,6 +1326,8 @@ class SQLiteIndexStore:
                         start_line=row["start_line"],
                         end_line=row["end_line"],
                         qualified_symbol_name=row["qualified_symbol_name"],
+                        language=row["language"],
+                        semantic_unit_kind=row["semantic_unit_kind"],
                     ),
                     vector_blob=row["embedding_vector"],
                 )
@@ -1012,7 +1406,8 @@ class SQLiteIndexStore:
                     relative_path,
                     start_line,
                     end_line,
-                    substr(source_snippet, 1, ?) AS source_snippet
+                    substr(source_snippet, 1, ?) AS source_snippet,
+                    language
                 FROM symbols
                 WHERE repository_id = ?
                     AND {column} = ?
@@ -1128,6 +1523,11 @@ class SQLiteIndexStore:
         relative_path: str,
     ) -> None:
         connection.execute(
+            "DELETE FROM lexical_documents "
+            "WHERE repository_id = ? AND relative_path = ?",
+            (repository_id, relative_path),
+        )
+        connection.execute(
             """
             DELETE FROM embeddings
             WHERE chunk_id IN (
@@ -1162,9 +1562,10 @@ class SQLiteIndexStore:
                 relative_path,
                 modified_time_ns,
                 size_bytes,
-                content_hash
+                content_hash,
+                language
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1173,6 +1574,7 @@ class SQLiteIndexStore:
                     file.modified_time_ns,
                     file.size_bytes,
                     file.content_hash,
+                    file.language,
                 )
                 for file in files
             ],
@@ -1194,9 +1596,10 @@ class SQLiteIndexStore:
                 relative_path,
                 start_line,
                 end_line,
-                source_snippet
+                source_snippet,
+                language
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1209,6 +1612,7 @@ class SQLiteIndexStore:
                     symbol.start_line,
                     symbol.end_line,
                     symbol.source_snippet,
+                    symbol.language,
                 )
                 for symbol in symbols
             ],
@@ -1229,9 +1633,11 @@ class SQLiteIndexStore:
                 end_line,
                 symbol_id,
                 raw_text,
-                content_hash
+                content_hash,
+                language,
+                semantic_unit_kind
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1243,6 +1649,8 @@ class SQLiteIndexStore:
                     str(chunk.symbol_id) if chunk.symbol_id else None,
                     chunk.raw_text,
                     chunk.content_hash,
+                    chunk.language,
+                    chunk.semantic_unit_kind,
                 )
                 for chunk in chunks
             ],
@@ -1275,6 +1683,52 @@ class SQLiteIndexStore:
                     pack_vector(vector),
                 )
                 for chunk, vector in zip(chunks, embeddings, strict=True)
+            ],
+        )
+
+    @staticmethod
+    def _insert_lexical_documents(
+        connection: sqlite3.Connection,
+        documents: list[LexicalDocument],
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO lexical_documents (
+                document_id,
+                repository_id,
+                record_id,
+                result_type,
+                semantic_unit_kind,
+                language,
+                relative_path,
+                name,
+                qualified_name,
+                identifier_terms,
+                content,
+                start_line,
+                end_line,
+                snippet
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    document.document_id,
+                    str(document.repository_id),
+                    str(document.record_id),
+                    document.result_type,
+                    document.semantic_unit_kind,
+                    document.language,
+                    document.relative_path,
+                    document.name,
+                    document.qualified_name,
+                    document.identifier_terms,
+                    document.content,
+                    document.start_line,
+                    document.end_line,
+                    document.snippet,
+                )
+                for document in documents
             ],
         )
 
@@ -1313,15 +1767,49 @@ def _embedding_provider_expression(
 def _path_filter_clause(column: str, path_filter: str) -> tuple[str, list[str]]:
     """Return a safe SQL clause for one file or directory-prefix filter."""
 
-    allowed_columns = {"relative_path", "chunks.relative_path"}
+    allowed_columns = {
+        "relative_path",
+        "chunks.relative_path",
+        "lexical_documents.relative_path",
+    }
     if column not in allowed_columns:
         raise ValueError(f"Unsupported path filter column: {column}")
 
-    escaped_prefix = (
-        path_filter.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    )
+    escaped_prefix = _escape_like(path_filter)
     clause = f"AND ({column} = ? OR {column} LIKE ? ESCAPE '\\')"
     return clause, [path_filter, f"{escaped_prefix}/%"]
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _validate_lexical_limits(limit: int, max_snippet_chars: int) -> None:
+    if limit < 1:
+        raise ValueError("limit must be greater than 0")
+    if max_snippet_chars < 1:
+        raise ValueError("max_snippet_chars must be greater than 0")
+
+
+def _lexical_candidate_from_row(row: sqlite3.Row) -> StoredLexicalCandidate:
+    keys = set(row.keys())
+    return StoredLexicalCandidate(
+        record_id=uuid.UUID(row["record_id"]),
+        result_type=row["result_type"],
+        semantic_unit_kind=row["semantic_unit_kind"],
+        language=row["language"],
+        relative_path=row["relative_path"],
+        name=row["name"],
+        qualified_name=row["qualified_name"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        snippet=row["snippet"],
+        raw_bm25_rank=(
+            float(row["raw_bm25_rank"])
+            if "raw_bm25_rank" in keys
+            else None
+        ),
+    )
 
 
 def _symbol_from_row(row: sqlite3.Row) -> Symbol:
@@ -1337,4 +1825,5 @@ def _symbol_from_row(row: sqlite3.Row) -> Symbol:
         start_line=row["start_line"],
         end_line=row["end_line"],
         source_snippet=row["source_snippet"],
+        language=row["language"],
     )

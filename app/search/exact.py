@@ -62,6 +62,11 @@ def exact_search(
     for symbol in symbols:
         raise_if_cancelled(cancellation_callback)
         snippet = symbol.source_snippet[: request.max_snippet_chars]
+        channel = (
+            "exact_qualified"
+            if query == symbol.qualified_name
+            else "exact_short"
+        )
         results.append(
             SearchResult(
                 id=symbol.id,
@@ -70,11 +75,20 @@ def exact_search(
                 start_line=symbol.start_line,
                 end_line=symbol.end_line,
                 symbol_name=bounded_symbol_name(symbol.qualified_name),
+                language=symbol.language,
                 snippet=snippet,
                 snippet_truncated=len(snippet) < len(symbol.source_snippet),
                 score=1.0,
                 mode="exact",
                 backend="python",
+                retrieval_channels=[channel],
+                retrieval_evidence=[
+                    {
+                        "channel": channel,
+                        "score": 1.0,
+                        "rank": len(results) + 1,
+                    }
+                ],
             )
         )
 

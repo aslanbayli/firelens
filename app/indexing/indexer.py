@@ -16,14 +16,21 @@ from typing import Callable
 
 from app.core.cancellation import CancellationCallback, OperationCancelledError
 from app.core.models import Chunk, Repository, Symbol
-from app.indexing.chunker import build_embedding_text, chunk_symbols
+from app.indexing.adapters import (
+    DEFAULT_ADAPTER_REGISTRY,
+    LanguageAdapter,
+    LanguageAdapterRegistry,
+)
+from app.indexing.analysis import SourceFile
+from app.indexing.chunker import build_embedding_text, chunk_semantic_units
 from app.indexing.embedder import Embedder, validate_embeddings
 from app.indexing.file_io import read_regular_file
 from app.indexing.manifest import build_file_manifest, compare_file_manifests
-from app.indexing.parser import parse_symbols
+from app.indexing.version import INDEX_FORMAT_VERSION
 from app.indexing.walker import walk
 from app.storage.database import (
     IndexedFileRecords,
+    LexicalDocument,
     SQLiteIndexStore,
     default_database_path,
 )
@@ -57,6 +64,7 @@ class InMemoryIndex:
     embeddings: list[list[float]]
     # Recoverable failures that did not stop indexing other files.
     errors: list[IndexingError]
+    lexical_documents: list[LexicalDocument]
 
 
 @dataclass
@@ -68,6 +76,7 @@ class IndexingReport:
     symbol_count: int
     chunk_count: int
     embedding_count: int
+    lexical_document_count: int
     file_count: int
     added_file_count: int
     changed_file_count: int
@@ -129,8 +138,9 @@ def index(
     max_entries: int = 100_000,
     max_chunks_per_file: int = 2_048,
     cancellation_callback: CancellationCallback | None = None,
+    adapter_registry: LanguageAdapterRegistry = DEFAULT_ADAPTER_REGISTRY,
 ) -> InMemoryIndex:
-    """Build an in-memory index for a local Python repository."""
+    """Build an in-memory index for a local supported repository."""
 
     # Convert strings to Path, expand "~", resolve "..", and produce one
     # canonical absolute root. The walker performs existence/type validation.
@@ -150,7 +160,7 @@ def index(
         # Serialize the canonical Path as a normal string.
         absolute_path=str(root),
         # Version the index format so future schema changes can be detected.
-        index_format_version="1",
+        index_format_version=INDEX_FORMAT_VERSION,
         # Store a timezone-aware current time as an integer Unix timestamp.
         timestamp_of_index=int(datetime.now(UTC).timestamp()),
         embedding_provider=embedder.provider,
@@ -170,6 +180,7 @@ def index(
         cancellation_callback=_indexing_cancellation_adapter(
             cancellation_callback
         ),
+        adapter_registry=adapter_registry,
     )
     raise_if_indexing_cancelled(cancellation_callback)
 
@@ -181,6 +192,7 @@ def index(
 
     # Collect recoverable failures rather than terminating the whole repository.
     errors: list[IndexingError] = []
+    lexical_documents: list[LexicalDocument] = []
 
     # Run each discovered file through read → parse → chunk.
     for relative_path in paths:
@@ -204,28 +216,35 @@ def index(
             # Parsing requires valid source text, so move to the next file.
             continue
 
-        try:
-            # Build an AST and extract classes/functions/methods. SyntaxError is
-            # deliberately allowed to reach this level for file context.
-            parsed_symbols = parse_symbols(source)
-        except SyntaxError as error:
-            # One invalid Python file should not discard healthy repository data.
+        adapter = adapter_registry.require_adapter(relative_path)
+        source_file = SourceFile(
+            relative_path=relative_path.as_posix(),
+            language=adapter.language,
+            text=source,
+        )
+        parsed_document = adapter.analyze(source_file)
+        if parsed_document.diagnostics:
+            diagnostic = parsed_document.diagnostics[0]
             errors.append(
                 IndexingError(
                     relative_path=relative_path.as_posix(),
-                    stage="parse",
-                    message=str(error),
+                    stage=diagnostic.stage,
+                    message=diagnostic.message,
                 )
             )
-
-            # Invalid syntax cannot provide trustworthy symbol line boundaries.
             continue
 
         # Add storage/domain identity and repository ownership to parser facts.
         file_symbols = [
             Symbol(
                 # Each declaration gets an independent unique ID.
-                id=uuid.uuid4(),
+                id=uuid.uuid5(
+                    repository_id,
+                    (
+                        f"{relative_path.as_posix()}:symbol:"
+                        f"{parsed.qualified_name}:{parsed.start_line}:{parsed.end_line}"
+                    ),
+                ),
                 # All declarations in this run belong to the same repository.
                 repository_id=repository_id,
                 # Copy syntax-derived values without changing their meaning.
@@ -238,9 +257,10 @@ def index(
                 start_line=parsed.start_line,
                 end_line=parsed.end_line,
                 source_snippet=parsed.source_snippet,
+                language=source_file.language,
             )
             # Create one validated Symbol for every ParsedSymbol.
-            for parsed in parsed_symbols
+            for parsed in parsed_document.symbols
         ]
 
         # Make this file's declarations available to exact/fuzzy retrieval and
@@ -248,15 +268,26 @@ def index(
         symbols.extend(file_symbols)
 
         try:
-            # Split every symbol into bounded, optionally overlapping chunks.
-            file_chunks = chunk_symbols(
-                source,
-                file_symbols,
+            file_chunks = chunk_semantic_units(
+                source_file,
+                parsed_document.semantic_units,
+                repository_id,
+                {
+                    symbol.qualified_name: symbol
+                    for symbol in file_symbols
+                },
                 max_chunks=max_chunks_per_file,
             )
 
             # Add this file's chunks to the complete index in processing order.
             chunks.extend(file_chunks)
+            lexical_documents.extend(
+                _lexical_documents_for_file(
+                    adapter,
+                    file_symbols,
+                    file_chunks,
+                )
+            )
         except ValueError as error:
             # Current ValueErrors indicate invalid line-window configuration.
             errors.append(
@@ -302,6 +333,7 @@ def index(
         chunks=chunks,
         embeddings=embeddings,
         errors=errors,
+        lexical_documents=lexical_documents,
     )
 
 
@@ -319,6 +351,7 @@ def index_to_sqlite(
     max_entries: int = 100_000,
     max_chunks_per_file: int = 2_048,
     cancellation_callback: CancellationCallback | None = None,
+    adapter_registry: LanguageAdapterRegistry = DEFAULT_ADAPTER_REGISTRY,
 ) -> IndexingReport:
     """Incrementally build an index and atomically replace the SQLite file."""
 
@@ -352,6 +385,7 @@ def index_to_sqlite(
             max_entries=max_entries,
             max_chunks_per_file=max_chunks_per_file,
             cancellation_callback=cancellation_callback,
+            adapter_registry=adapter_registry,
         )
 
 
@@ -365,6 +399,7 @@ def _index_to_sqlite_atomically(
     max_entries: int,
     max_chunks_per_file: int,
     cancellation_callback: CancellationCallback | None,
+    adapter_registry: LanguageAdapterRegistry,
 ) -> IndexingReport:
     """Build and promote a private snapshot while owning the database lock."""
 
@@ -414,6 +449,7 @@ def _index_to_sqlite_atomically(
             max_entries=max_entries,
             max_chunks_per_file=max_chunks_per_file,
             cancellation_callback=cancellation_callback,
+            adapter_registry=adapter_registry,
         )
         raise_if_indexing_cancelled(cancellation_callback)
         _emit_progress(
@@ -462,6 +498,7 @@ def _index_to_sqlite_in_place(
     max_entries: int,
     max_chunks_per_file: int,
     cancellation_callback: CancellationCallback | None,
+    adapter_registry: LanguageAdapterRegistry,
 ) -> IndexingReport:
     """Apply one incremental indexing run to a private SQLite snapshot."""
 
@@ -473,11 +510,8 @@ def _index_to_sqlite_in_place(
     store.initialize()
     raise_if_indexing_cancelled(cancellation_callback)
 
-    index_format_version = "1"
-    previous_repository = store.load_latest_repository(
-        absolute_path=str(root),
-        index_format_version=index_format_version,
-    )
+    index_format_version = INDEX_FORMAT_VERSION
+    previous_repository = store.load_latest_repository(absolute_path=str(root))
     existing_repository = store.load_repository_by_identity(
         absolute_path=str(root),
         index_format_version=index_format_version,
@@ -511,6 +545,7 @@ def _index_to_sqlite_in_place(
         max_files=max_files,
         max_entries=max_entries,
         cancellation_callback=granular_cancellation_callback,
+        adapter_registry=adapter_registry,
     )
     raise_if_indexing_cancelled(cancellation_callback)
     _emit_progress(
@@ -530,6 +565,7 @@ def _index_to_sqlite_in_place(
         max_files=max_files,
         max_entries=max_entries,
         cancellation_callback=granular_cancellation_callback,
+        adapter_registry=adapter_registry,
     )
     raise_if_indexing_cancelled(cancellation_callback)
     manifest_diff = compare_file_manifests(
@@ -595,6 +631,7 @@ def _index_to_sqlite_in_place(
             max_file_size,
             max_chunks_per_file,
             expected_content_hash=file_record.content_hash,
+            adapter_registry=adapter_registry,
         )
         raise_if_indexing_cancelled(cancellation_callback)
         errors.extend(file_index.errors)
@@ -671,6 +708,7 @@ def _index_to_sqlite_in_place(
                     symbols=file_index.symbols,
                     chunks=file_index.chunks,
                     embeddings=embeddings,
+                    lexical_documents=file_index.lexical_documents,
                 )
             ],
             deleted_relative_paths=[],
@@ -735,6 +773,10 @@ def _index_to_sqlite_in_place(
         symbol_count=store.count_rows("symbols", repository.id),
         chunk_count=store.count_rows("chunks", repository.id),
         embedding_count=store.count_rows("embeddings", repository.id),
+        lexical_document_count=store.count_rows(
+            "lexical_documents",
+            repository.id,
+        ),
         file_count=store.count_rows("files", repository.id),
         added_file_count=len(added_paths),
         changed_file_count=len(changed_paths),
@@ -792,6 +834,7 @@ class _FileIndex:
     symbols: list[Symbol]
     chunks: list[Chunk]
     errors: list[IndexingError]
+    lexical_documents: list[LexicalDocument]
 
 
 def _index_single_file(
@@ -804,6 +847,7 @@ def _index_single_file(
     max_file_size: int,
     max_chunks: int = 2_048,
     expected_content_hash: str | None = None,
+    adapter_registry: LanguageAdapterRegistry = DEFAULT_ADAPTER_REGISTRY,
 ) -> _FileIndex:
     """Parse and chunk one source file."""
 
@@ -824,6 +868,7 @@ def _index_single_file(
                     message=str(error),
                 )
             ],
+            lexical_documents=[],
         )
 
     if (
@@ -840,26 +885,40 @@ def _index_single_file(
                     message="Source file changed during indexing; retry",
                 )
             ],
+            lexical_documents=[],
         )
 
-    try:
-        parsed_symbols = parse_symbols(source)
-    except SyntaxError as error:
+    adapter = adapter_registry.require_adapter(relative_path)
+    source_file = SourceFile(
+        relative_path=relative_path,
+        language=adapter.language,
+        text=source,
+    )
+    parsed_document = adapter.analyze(source_file)
+    if parsed_document.diagnostics:
+        diagnostic = parsed_document.diagnostics[0]
         return _FileIndex(
             symbols=[],
             chunks=[],
             errors=[
                 IndexingError(
                     relative_path=relative_path,
-                    stage="parse",
-                    message=str(error),
+                    stage=diagnostic.stage,
+                    message=diagnostic.message,
                 )
             ],
+            lexical_documents=[],
         )
 
     symbols = [
         Symbol(
-            id=uuid.uuid4(),
+            id=uuid.uuid5(
+                repository_id,
+                (
+                    f"{relative_path}:symbol:{parsed.qualified_name}:"
+                    f"{parsed.start_line}:{parsed.end_line}"
+                ),
+            ),
             repository_id=repository_id,
             name=parsed.name,
             qualified_name=parsed.qualified_name,
@@ -868,12 +927,19 @@ def _index_single_file(
             start_line=parsed.start_line,
             end_line=parsed.end_line,
             source_snippet=parsed.source_snippet,
+            language=source_file.language,
         )
-        for parsed in parsed_symbols
+        for parsed in parsed_document.symbols
     ]
 
     try:
-        chunks = chunk_symbols(source, symbols, max_chunks=max_chunks)
+        chunks = chunk_semantic_units(
+            source_file,
+            parsed_document.semantic_units,
+            repository_id,
+            {symbol.qualified_name: symbol for symbol in symbols},
+            max_chunks=max_chunks,
+        )
     except ValueError as error:
         return _FileIndex(
             symbols=symbols,
@@ -885,9 +951,16 @@ def _index_single_file(
                     message=str(error),
                 )
             ],
+            lexical_documents=[],
         )
 
-    return _FileIndex(symbols=symbols, chunks=chunks, errors=[])
+    lexical_documents = _lexical_documents_for_file(adapter, symbols, chunks)
+    return _FileIndex(
+        symbols=symbols,
+        chunks=chunks,
+        errors=[],
+        lexical_documents=lexical_documents,
+    )
 
 
 def _read_source_text(
@@ -998,5 +1071,83 @@ def _embedding_text_for_chunk(
         raw_text=chunk.raw_text,
         # Module-level chunks omit symbol-specific metadata.
         qualified_name=symbol.qualified_name if symbol else None,
-        kind=symbol.kind if symbol else None,
+        kind=chunk.semantic_unit_kind,
+        language=chunk.language,
     )
+
+
+def _lexical_documents_for_file(
+    adapter: LanguageAdapter,
+    symbols: list[Symbol],
+    chunks: list[Chunk],
+) -> list[LexicalDocument]:
+    """Build storage-ready lexical documents without exposing SQL."""
+
+    documents: list[LexicalDocument] = []
+    symbols_by_id = {symbol.id: symbol for symbol in symbols}
+    for symbol in symbols:
+        terms = _identifier_term_text(
+            adapter,
+            symbol.name,
+            symbol.qualified_name,
+            symbol.relative_path,
+        )
+        documents.append(
+            LexicalDocument(
+                document_id=f"symbol:{symbol.id}",
+                repository_id=symbol.repository_id,
+                record_id=symbol.id,
+                result_type="symbol",
+                semantic_unit_kind=None,
+                language=symbol.language,
+                relative_path=symbol.relative_path,
+                name=symbol.name,
+                qualified_name=symbol.qualified_name,
+                identifier_terms=terms,
+                content=symbol.source_snippet,
+                start_line=symbol.start_line,
+                end_line=symbol.end_line,
+                snippet=symbol.source_snippet,
+            )
+        )
+
+    for chunk in chunks:
+        symbol = symbols_by_id.get(chunk.symbol_id) if chunk.symbol_id else None
+        terms = _identifier_term_text(
+            adapter,
+            symbol.name if symbol is not None else "",
+            symbol.qualified_name if symbol is not None else "",
+            chunk.relative_path,
+        )
+        documents.append(
+            LexicalDocument(
+                document_id=f"chunk:{chunk.id}",
+                repository_id=chunk.repository_id,
+                record_id=chunk.id,
+                result_type="chunk",
+                semantic_unit_kind=chunk.semantic_unit_kind,
+                language=chunk.language,
+                relative_path=chunk.relative_path,
+                name=symbol.name if symbol is not None else None,
+                qualified_name=(
+                    symbol.qualified_name if symbol is not None else None
+                ),
+                identifier_terms=terms,
+                content=chunk.raw_text,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+                snippet=chunk.raw_text,
+            )
+        )
+    return documents
+
+
+def _identifier_term_text(adapter: LanguageAdapter, *values: str) -> str:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for term in adapter.identifier_terms(value):
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+    return " ".join(terms)
