@@ -308,7 +308,7 @@ uv run streamlit run app/client/streamlit_app.py --server.fileWatcherType none
 Use the sidebar to select or index a repository, then compare search modes,
 backends, snippets, scores, and graph evidence.
 
-![FireLens Streamlit search interface](static/streamlit-ss.png)
+![FireLens Streamlit search interface](static/streamlit-ss-2.png)
 
 ## How it works
 
