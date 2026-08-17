@@ -5,8 +5,9 @@ Coding agents fail partly because they retrieve code that is textually similar b
 
 FireLens is a retrieval and inference benchmark for AI coding agents, with hybrid code search, graph-aware retrieval, MCP integration, and Mojo-accelerated hot paths.
 
-It indexes repository symbols, semantic chunks, and embeddings into SQLite so
-code can be retrieved with exact, fuzzy, lexical, semantic, or hybrid search.
+It indexes repository symbols, semantic chunks, embeddings, and statically
+derived graph relationships into SQLite so code can be retrieved with exact,
+fuzzy, lexical, semantic, hybrid, or graph-aware search.
 FireLens is not a chatbot. Retrieval and indexing are the product.
 
 
@@ -20,6 +21,9 @@ FireLens is not a chatbot. Retrieval and indexing are the product.
   typo-recovery evidence
 - semantic code search using normalized vector similarity
 - explicit reciprocal-rank-fusion and normalized-weighted hybrid modes
+- statically derived calls, imports, inheritance, references, file dependency,
+  and test-to-implementation graph edges
+- bounded one- or two-hop graph expansion from hybrid, lexical, or semantic seeds
 - stable symbol/chunk deduplication, result provenance, and component timings
 - optional Mojo CPU kernels for fuzzy scoring and large semantic rankings
 - exact-first automatic routing across exact, fuzzy, and semantic search
@@ -120,15 +124,17 @@ uv run firelens search ~/projects/firelens "where are indexes persisted?" \
   --mode semantic --top-k 5 --path app/storage
 uv run firelens search ~/projects/firelens "where is authentication checked?" \
   --mode hybrid_rrf --top-k 5
+uv run firelens search ~/projects/firelens "authentication tests" \
+  --mode graph --top-k 8
 ```
 
 Commands write structured JSON to stdout. Indexing progress and errors go to
 stderr, so stdout remains safe to pipe into another program.
 
 `--mode` accepts `auto`, `exact`, `fuzzy`, `lexical`, `semantic`,
-`hybrid_rrf`, and `hybrid_weighted`. `auto` intentionally retains its
-exact/fuzzy/semantic routing behavior; select a hybrid mode explicitly until
-evaluation data supports a calibrated default.
+`hybrid_rrf`, `hybrid_weighted`, and `graph`. `auto` intentionally retains its
+exact/fuzzy/semantic routing behavior; select hybrid or graph retrieval
+explicitly until evaluation data supports a calibrated default.
 
 ## Retrieval modes and hybrid behavior
 
@@ -164,6 +170,55 @@ by `--top-k`. RRF controls are `FIRELENS_HYBRID_RRF_K`,
 `FIRELENS_HYBRID_WEIGHTED_LEXICAL_WEIGHT`,
 `FIRELENS_HYBRID_WEIGHTED_SEMANTIC_WEIGHT`, and
 `FIRELENS_HYBRID_WEIGHTED_MISSING_SOURCE_VALUE`.
+
+## Graph-aware retrieval
+
+The Python adapter statically extracts unresolved calls, imports, base classes,
+loaded references, and test evidence while it parses each changed file. FireLens
+persists those language-neutral facts, resolves them across the complete staged
+repository snapshot, and records confidence, source ranges, adapter versions,
+resolution methods, and bounded evidence. Ambiguous or unresolved facts are
+counted in indexing and status responses instead of being guessed.
+
+The named `graph` mode uses hybrid RRF results as seeds by default. It maps each
+seed to symbol, module, and file nodes, loads bounded incoming and outgoing
+adjacency, and expands one hop. Multiple paths to the same node use the maximum
+contribution, with deterministic source-location tie ordering:
+
+```text
+contribution = seed_score
+             * path_edge_weights
+             * path_edge_confidences
+             * hop_decay^hop_count
+```
+
+Every expanded result includes the originating seed, last traversed edge kind
+and direction, hop count, edge confidence, and final graph contribution. MCP
+and CLI responses return this compact evidence only; they never serialize full
+graph subtrees. Normal `top_k`, per-snippet, total-context, path, and
+cancellation limits still apply.
+
+Graph traversal defaults and controls are:
+
+- `FIRELENS_GRAPH_SEED_MODE`: `hybrid_rrf` by default, or `lexical`/`semantic`
+  for experiments.
+- `FIRELENS_GRAPH_SEED_COUNT`: bounded seed pool, default `5`.
+- `FIRELENS_GRAPH_MAX_HOPS`: default `1`, hard maximum `2`.
+- `FIRELENS_GRAPH_MAX_NEIGHBORS_PER_NODE`: default `20`.
+- `FIRELENS_GRAPH_MAX_EXPANDED_NODES`: default `50`.
+- `FIRELENS_GRAPH_ALLOWED_EDGE_KINDS`: comma-separated edge kinds.
+- `FIRELENS_GRAPH_DIRECTIONS`: comma-separated `outgoing` and/or `incoming`.
+- `FIRELENS_GRAPH_MIN_EDGE_CONFIDENCE`: default `0.55`.
+- `FIRELENS_GRAPH_HOP_DECAY`: default `0.7`.
+- Per-edge weights use `FIRELENS_GRAPH_CALLS_WEIGHT`,
+  `FIRELENS_GRAPH_IMPORTS_WEIGHT`, `FIRELENS_GRAPH_INHERITS_WEIGHT`,
+  `FIRELENS_GRAPH_REFERENCES_WEIGHT`, `FIRELENS_GRAPH_DEPENDS_ON_WEIGHT`, and
+  `FIRELENS_GRAPH_TESTS_WEIGHT`.
+
+Graph tables participate in the same staged atomic replacement as files,
+symbols, chunks, lexical documents, and embeddings. If parsing, resolution,
+embedding, or cancellation interrupts a build, the previous valid database
+remains active.
 
 ## Use FireLens as an MCP server
 
@@ -347,8 +402,8 @@ In the sidebar:
 
 1. Select an existing index or enter a new repository path.
 2. Click **Index / Re-index** when the repository needs indexing.
-3. Choose `auto`, `exact`, `fuzzy`, `lexical`, `semantic`, `hybrid_rrf`, or
-   `hybrid_weighted`, then select a compute backend.
+3. Choose one of `auto`, `exact`, `fuzzy`, `lexical`, `semantic`, `hybrid_rrf`,
+   `hybrid_weighted`, or `graph`, then select a compute backend.
 4. Enter a query and optionally restrict it to a repository-relative file or
    directory prefix.
 
