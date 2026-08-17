@@ -106,8 +106,8 @@ class LexicalQueryTests(unittest.TestCase):
         self.assertIn('content : "bar"', query)
         self.assertEqual(safe_fts_terms("HTTPClient"), ("httpclient", "http", "client"))
 
-    def test_cli_accepts_lexical_and_hybrid_modes(self) -> None:
-        for mode in ("lexical", "hybrid_rrf", "hybrid_weighted"):
+    def test_cli_accepts_lexical_hybrid_and_graph_modes(self) -> None:
+        for mode in ("lexical", "hybrid_rrf", "hybrid_weighted", "graph"):
             with self.subTest(mode=mode):
                 parsed = build_parser().parse_args(
                     ["search", ".", "query", "--mode", mode]

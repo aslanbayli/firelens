@@ -66,17 +66,58 @@ class SemanticUnit:
 
 
 @dataclass(frozen=True)
+class GraphNodeDefinition:
+    """A language-neutral graph node emitted by a source adapter."""
+
+    node_kind: str
+    qualified_name: str
+    name: str
+    relative_path: str
+    start_line: int
+    end_line: int
+    symbol_qualified_name: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_label(self.node_kind, "graph node kind")
+        if not self.qualified_name or not self.name or not self.relative_path:
+            raise ValueError("graph node identity fields must not be empty")
+        _validate_source_range(self.start_line, self.end_line)
+
+
+@dataclass(frozen=True)
 class UnresolvedGraphFact:
-    """A language-neutral relationship awaiting repository-wide resolution."""
+    """A parser-neutral relationship awaiting repository-wide resolution."""
 
     edge_kind: str
     source_reference: str
     target_reference: str
+    source_scope: str
+    source_file: str
+    start_line: int
+    end_line: int
+    extraction_adapter: str
+    adapter_version: str
+    confidence: float
+    target_kind: str = "any"
+    target_qualified_hint: str | None = None
+    hint_resolution_method: str | None = None
+    evidence_text: str | None = None
 
     def __post_init__(self) -> None:
         _validate_label(self.edge_kind, "edge kind")
+        _validate_label(self.extraction_adapter, "extraction adapter")
+        _validate_label(self.target_kind, "graph target kind")
         if not self.source_reference or not self.target_reference:
             raise ValueError("graph references must not be empty")
+        if not self.source_scope or not self.source_file:
+            raise ValueError("graph source context must not be empty")
+        if not self.adapter_version:
+            raise ValueError("adapter_version must not be empty")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("graph fact confidence must be between 0 and 1")
+        if self.evidence_text is not None and len(self.evidence_text) > 256:
+            raise ValueError("graph evidence text must be at most 256 characters")
+        _validate_source_range(self.start_line, self.end_line)
 
 
 @dataclass(frozen=True)
@@ -95,6 +136,7 @@ class ParsedDocument:
     source_file: SourceFile
     symbols: tuple[ParsedSymbol, ...] = ()
     semantic_units: tuple[SemanticUnit, ...] = ()
+    graph_nodes: tuple[GraphNodeDefinition, ...] = ()
     graph_facts: tuple[UnresolvedGraphFact, ...] = ()
     diagnostics: tuple[AnalysisDiagnostic, ...] = ()
 

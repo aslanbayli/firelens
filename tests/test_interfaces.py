@@ -297,7 +297,7 @@ class McpInMemoryContractTests(unittest.IsolatedAsyncioTestCase):
         search_input = tools["search_code"].input_schema["properties"]
         self.assertEqual(search_input["mode"]["default"], "auto")
         self.assertTrue(
-            {"hybrid_rrf", "hybrid_weighted"}
+            {"hybrid_rrf", "hybrid_weighted", "graph"}
             <= set(search_input["mode"]["enum"])
         )
         self.assertEqual(search_input["query"]["maxLength"], 2_000)

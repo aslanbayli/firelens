@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.core.cancellation import CancellationCallback, OperationCancelledError
-from app.core.models import Chunk, Repository, Symbol
+from app.core.models import Chunk, GraphFact, GraphNode, Repository, Symbol
 from app.indexing.adapters import (
     DEFAULT_ADAPTER_REGISTRY,
     LanguageAdapter,
@@ -25,6 +25,11 @@ from app.indexing.analysis import SourceFile
 from app.indexing.chunker import build_embedding_text, chunk_semantic_units
 from app.indexing.embedder import Embedder, validate_embeddings
 from app.indexing.file_io import read_regular_file
+from app.indexing.graph import (
+    build_file_graph_records,
+    repository_graph_node,
+    resolve_graph_facts,
+)
 from app.indexing.manifest import build_file_manifest, compare_file_manifests
 from app.indexing.version import INDEX_FORMAT_VERSION
 from app.indexing.walker import walk
@@ -77,6 +82,11 @@ class IndexingReport:
     chunk_count: int
     embedding_count: int
     lexical_document_count: int
+    graph_node_count: int
+    graph_fact_count: int
+    graph_edge_count: int
+    unresolved_graph_fact_count: int
+    ambiguous_graph_fact_count: int
     file_count: int
     added_file_count: int
     changed_file_count: int
@@ -709,6 +719,8 @@ def _index_to_sqlite_in_place(
                     chunks=file_index.chunks,
                     embeddings=embeddings,
                     lexical_documents=file_index.lexical_documents,
+                    graph_nodes=file_index.graph_nodes,
+                    graph_facts=file_index.graph_facts,
                 )
             ],
             deleted_relative_paths=[],
@@ -758,6 +770,51 @@ def _index_to_sqlite_in_place(
     if existing_repository is None:
         store.delete_other_repositories_by_path(str(root), repository.id)
     raise_if_indexing_cancelled(cancellation_callback)
+
+    _emit_progress(
+        progress_callback,
+        "graph",
+        0,
+        1,
+        "Resolving repository graph",
+    )
+    repository_node = repository_graph_node(repository)
+    # The root node is inserted with the resolved edge replacement. File,
+    # module, and symbol nodes were already updated transactionally per file.
+    graph_nodes = [
+        repository_node,
+        *(
+            node
+            for node in store.load_graph_nodes(repository.id)
+            if node.kind != "repository"
+        ),
+    ]
+    graph_facts = store.load_graph_facts(repository.id)
+    graph_resolution = resolve_graph_facts(
+        repository.id,
+        graph_nodes,
+        graph_facts,
+        cancellation_callback=granular_cancellation_callback,
+    )
+    raise_if_indexing_cancelled(cancellation_callback)
+    store.replace_graph_resolution(
+        repository_node,
+        graph_resolution.edges,
+        graph_resolution.fact_resolutions,
+    )
+    raise_if_indexing_cancelled(cancellation_callback)
+    _emit_progress(
+        progress_callback,
+        "graph",
+        1,
+        1,
+        (
+            f"Resolved {len(graph_resolution.edges)} edges; "
+            f"{graph_resolution.unresolved_count} unresolved and "
+            f"{graph_resolution.ambiguous_count} ambiguous facts"
+        ),
+    )
+
     total_database_changes = written_file_count + len(deleted_paths)
     _emit_progress(
         progress_callback,
@@ -777,6 +834,11 @@ def _index_to_sqlite_in_place(
             "lexical_documents",
             repository.id,
         ),
+        graph_node_count=store.count_rows("graph_nodes", repository.id),
+        graph_fact_count=store.count_rows("graph_facts", repository.id),
+        graph_edge_count=store.count_rows("graph_edges", repository.id),
+        unresolved_graph_fact_count=graph_resolution.unresolved_count,
+        ambiguous_graph_fact_count=graph_resolution.ambiguous_count,
         file_count=store.count_rows("files", repository.id),
         added_file_count=len(added_paths),
         changed_file_count=len(changed_paths),
@@ -835,6 +897,8 @@ class _FileIndex:
     chunks: list[Chunk]
     errors: list[IndexingError]
     lexical_documents: list[LexicalDocument]
+    graph_nodes: list[GraphNode]
+    graph_facts: list[GraphFact]
 
 
 def _index_single_file(
@@ -869,6 +933,8 @@ def _index_single_file(
                 )
             ],
             lexical_documents=[],
+            graph_nodes=[],
+            graph_facts=[],
         )
 
     if (
@@ -886,6 +952,8 @@ def _index_single_file(
                 )
             ],
             lexical_documents=[],
+            graph_nodes=[],
+            graph_facts=[],
         )
 
     adapter = adapter_registry.require_adapter(relative_path)
@@ -908,6 +976,8 @@ def _index_single_file(
                 )
             ],
             lexical_documents=[],
+            graph_nodes=[],
+            graph_facts=[],
         )
 
     symbols = [
@@ -952,14 +1022,39 @@ def _index_single_file(
                 )
             ],
             lexical_documents=[],
+            graph_nodes=[],
+            graph_facts=[],
         )
 
     lexical_documents = _lexical_documents_for_file(adapter, symbols, chunks)
+    try:
+        graph_nodes, graph_facts = build_file_graph_records(
+            repository_id,
+            parsed_document,
+            symbols,
+        )
+    except ValueError as error:
+        return _FileIndex(
+            symbols=symbols,
+            chunks=chunks,
+            errors=[
+                IndexingError(
+                    relative_path=relative_path,
+                    stage="graph",
+                    message=str(error),
+                )
+            ],
+            lexical_documents=lexical_documents,
+            graph_nodes=[],
+            graph_facts=[],
+        )
     return _FileIndex(
         symbols=symbols,
         chunks=chunks,
         errors=[],
         lexical_documents=lexical_documents,
+        graph_nodes=graph_nodes,
+        graph_facts=graph_facts,
     )
 
 

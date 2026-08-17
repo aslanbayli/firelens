@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
-from app.core.models import Chunk, Repository, Symbol
+from app.core.models import Chunk, GraphEdge, GraphFact, GraphNode, Repository, Symbol
 
 
 class SearchCandidateLimitError(ValueError):
@@ -64,6 +64,38 @@ class IndexedFileRecords:
     chunks: list[Chunk]
     embeddings: list[list[float]]
     lexical_documents: list[LexicalDocument] = field(default_factory=list)
+    graph_nodes: list[GraphNode] = field(default_factory=list)
+    graph_facts: list[GraphFact] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StoredGraphNeighbor:
+    """One bounded adjacency row oriented from the traversal node."""
+
+    edge_id: uuid.UUID
+    current_node_id: uuid.UUID
+    neighbor_node_id: uuid.UUID
+    kind: str
+    direction: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class StoredGraphResult:
+    """A graph node mapped to one retrievable symbol or chunk record."""
+
+    node_id: uuid.UUID
+    record_id: uuid.UUID
+    result_type: str
+    semantic_unit_kind: str | None
+    language: str
+    relative_path: str
+    name: str | None
+    qualified_name: str | None
+    start_line: int
+    end_line: int
+    snippet: str
+    symbol_id: uuid.UUID | None
 
 
 def default_database_path(
@@ -302,6 +334,79 @@ class SQLiteIndexStore:
                         ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS graph_nodes (
+                    id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    qualified_name TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    relative_path TEXT,
+                    start_line INTEGER,
+                    end_line INTEGER,
+                    symbol_id TEXT,
+                    language TEXT,
+                    UNIQUE(repository_id, kind, qualified_name, relative_path),
+                    FOREIGN KEY(repository_id)
+                        REFERENCES repositories(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(symbol_id)
+                        REFERENCES symbols(id)
+                        ON DELETE SET NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_facts (
+                    id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    source_node_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source_reference TEXT NOT NULL,
+                    target_reference TEXT NOT NULL,
+                    source_scope TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    extraction_adapter TEXT NOT NULL,
+                    adapter_version TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    target_qualified_hint TEXT,
+                    hint_resolution_method TEXT,
+                    evidence_text TEXT,
+                    resolution_status TEXT NOT NULL DEFAULT 'unresolved',
+                    resolution_method TEXT,
+                    FOREIGN KEY(repository_id)
+                        REFERENCES repositories(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(source_node_id)
+                        REFERENCES graph_nodes(id)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_edges (
+                    id TEXT PRIMARY KEY,
+                    repository_id TEXT NOT NULL,
+                    source_node_id TEXT NOT NULL,
+                    target_node_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    extraction_adapter TEXT NOT NULL,
+                    adapter_version TEXT NOT NULL,
+                    resolution_method TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    evidence_text TEXT,
+                    FOREIGN KEY(repository_id)
+                        REFERENCES repositories(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(source_node_id)
+                        REFERENCES graph_nodes(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY(target_node_id)
+                        REFERENCES graph_nodes(id)
+                        ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_symbols_name
                     ON symbols(repository_id, name);
                 CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name
@@ -322,6 +427,24 @@ class SQLiteIndexStore:
                     ON lexical_documents(repository_id, qualified_name, name);
                 CREATE INDEX IF NOT EXISTS idx_lexical_documents_path
                     ON lexical_documents(repository_id, relative_path);
+                CREATE INDEX IF NOT EXISTS idx_graph_nodes_repository_kind
+                    ON graph_nodes(repository_id, kind);
+                CREATE INDEX IF NOT EXISTS idx_graph_nodes_path
+                    ON graph_nodes(repository_id, relative_path);
+                CREATE INDEX IF NOT EXISTS idx_graph_nodes_qualified_name
+                    ON graph_nodes(repository_id, qualified_name);
+                CREATE INDEX IF NOT EXISTS idx_graph_nodes_symbol_id
+                    ON graph_nodes(repository_id, symbol_id);
+                CREATE INDEX IF NOT EXISTS idx_graph_facts_repository_file
+                    ON graph_facts(repository_id, source_file);
+                CREATE INDEX IF NOT EXISTS idx_graph_facts_status
+                    ON graph_facts(repository_id, resolution_status);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_source
+                    ON graph_edges(repository_id, source_node_id, kind);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_target
+                    ON graph_edges(repository_id, target_node_id, kind);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_file
+                    ON graph_edges(repository_id, source_file);
                 """
             )
             repository_columns = {
@@ -484,6 +607,9 @@ class SQLiteIndexStore:
         chunks: list[Chunk],
         embeddings: list[list[float]],
         lexical_documents: list[LexicalDocument] | None = None,
+        graph_nodes: list[GraphNode] | None = None,
+        graph_facts: list[GraphFact] | None = None,
+        graph_edges: list[GraphEdge] | None = None,
     ) -> None:
         """Replace all persisted records for a repository in one transaction."""
 
@@ -498,6 +624,18 @@ class SQLiteIndexStore:
 
         with self.connect() as connection:
             self._upsert_repository(connection, repository)
+            connection.execute(
+                "DELETE FROM graph_edges WHERE repository_id = ?",
+                (repository_id,),
+            )
+            connection.execute(
+                "DELETE FROM graph_facts WHERE repository_id = ?",
+                (repository_id,),
+            )
+            connection.execute(
+                "DELETE FROM graph_nodes WHERE repository_id = ?",
+                (repository_id,),
+            )
             connection.execute(
                 "DELETE FROM embeddings WHERE repository_id = ?",
                 (repository_id,),
@@ -523,6 +661,9 @@ class SQLiteIndexStore:
             self._insert_chunks(connection, chunks)
             self._insert_embeddings(connection, repository, chunks, embeddings)
             self._insert_lexical_documents(connection, lexical_documents or [])
+            self._insert_graph_nodes(connection, graph_nodes or [])
+            self._insert_graph_facts(connection, graph_facts or [])
+            self._insert_graph_edges(connection, graph_edges or [])
 
     def apply_file_updates(
         self,
@@ -567,6 +708,8 @@ class SQLiteIndexStore:
                     connection,
                     file_records.lexical_documents,
                 )
+                self._insert_graph_nodes(connection, file_records.graph_nodes)
+                self._insert_graph_facts(connection, file_records.graph_facts)
 
     def count_rows(self, table: str, repository_id: uuid.UUID) -> int:
         """Return a repository-scoped row count for tests and diagnostics."""
@@ -577,6 +720,9 @@ class SQLiteIndexStore:
             "chunks",
             "embeddings",
             "lexical_documents",
+            "graph_nodes",
+            "graph_facts",
+            "graph_edges",
         }
         if table not in allowed_tables:
             raise ValueError(f"Unsupported table: {table}")
@@ -587,6 +733,23 @@ class SQLiteIndexStore:
                 (str(repository_id),),
             ).fetchone()
 
+        return int(row["count"])
+
+    def count_graph_facts_by_status(
+        self,
+        repository_id: uuid.UUID,
+        status: str,
+    ) -> int:
+        """Return a bounded graph-resolution diagnostic count."""
+
+        if status not in {"resolved", "unresolved", "ambiguous"}:
+            raise ValueError(f"Unsupported graph fact status: {status}")
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM graph_facts "
+                "WHERE repository_id = ? AND resolution_status = ?",
+                (str(repository_id), status),
+            ).fetchone()
         return int(row["count"])
 
     def load_repository_by_identity(
@@ -817,6 +980,381 @@ class SQLiteIndexStore:
             )
             for row in rows
         }
+
+    def load_graph_nodes(self, repository_id: uuid.UUID) -> list[GraphNode]:
+        """Load all graph nodes for deterministic repository-wide resolution."""
+
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    repository_id,
+                    kind,
+                    qualified_name,
+                    name,
+                    relative_path,
+                    start_line,
+                    end_line,
+                    symbol_id,
+                    language
+                FROM graph_nodes
+                WHERE repository_id = ?
+                ORDER BY relative_path, qualified_name, kind, id
+                """,
+                (str(repository_id),),
+            ).fetchall()
+        return [_graph_node_from_row(row) for row in rows]
+
+    def load_graph_facts(self, repository_id: uuid.UUID) -> list[GraphFact]:
+        """Load adapter facts without exposing graph SQL to the resolver."""
+
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    repository_id,
+                    source_node_id,
+                    kind,
+                    source_reference,
+                    target_reference,
+                    source_scope,
+                    source_file,
+                    start_line,
+                    end_line,
+                    extraction_adapter,
+                    adapter_version,
+                    confidence,
+                    target_kind,
+                    target_qualified_hint,
+                    hint_resolution_method,
+                    evidence_text
+                FROM graph_facts
+                WHERE repository_id = ?
+                ORDER BY source_file, start_line, end_line, kind, id
+                """,
+                (str(repository_id),),
+            ).fetchall()
+        return [_graph_fact_from_row(row) for row in rows]
+
+    def load_graph_edges(
+        self,
+        repository_id: uuid.UUID,
+        edge_kind: str | None = None,
+    ) -> list[GraphEdge]:
+        """Load resolved edges for diagnostics and focused graph tests."""
+
+        kind_clause = ""
+        parameters = [str(repository_id)]
+        if edge_kind is not None:
+            kind_clause = "AND kind = ?"
+            parameters.append(edge_kind)
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    repository_id,
+                    source_node_id,
+                    target_node_id,
+                    kind,
+                    source_file,
+                    start_line,
+                    end_line,
+                    extraction_adapter,
+                    adapter_version,
+                    resolution_method,
+                    confidence,
+                    evidence_text
+                FROM graph_edges
+                WHERE repository_id = ? {kind_clause}
+                ORDER BY source_node_id, kind, target_node_id, source_file, start_line, id
+                """,
+                parameters,
+            ).fetchall()
+        return [_graph_edge_from_row(row) for row in rows]
+
+    def replace_graph_resolution(
+        self,
+        repository_node: GraphNode,
+        edges: list[GraphEdge],
+        fact_resolutions: dict[uuid.UUID, tuple[str, str | None]],
+    ) -> None:
+        """Atomically replace resolved edges and fact diagnostics."""
+
+        repository_id = str(repository_node.repository_id)
+        with self.connect() as connection:
+            self._insert_graph_nodes(connection, [repository_node])
+            connection.execute(
+                "DELETE FROM graph_edges WHERE repository_id = ?",
+                (repository_id,),
+            )
+            connection.execute(
+                "UPDATE graph_facts SET resolution_status = 'unresolved', "
+                "resolution_method = NULL WHERE repository_id = ?",
+                (repository_id,),
+            )
+            for fact_id, (status, method) in fact_resolutions.items():
+                connection.execute(
+                    "UPDATE graph_facts SET resolution_status = ?, "
+                    "resolution_method = ? WHERE repository_id = ? AND id = ?",
+                    (status, method, repository_id, str(fact_id)),
+                )
+            self._insert_graph_edges(connection, edges)
+
+    def load_graph_nodes_for_results(
+        self,
+        repository_id: uuid.UUID,
+        symbol_ids: Iterable[uuid.UUID],
+        relative_paths: Iterable[str],
+    ) -> list[GraphNode]:
+        """Map a bounded result set to symbol, module, and file graph nodes."""
+
+        unique_symbol_ids = list(dict.fromkeys(symbol_ids))
+        unique_paths = list(dict.fromkeys(relative_paths))
+        clauses: list[str] = []
+        parameters: list[str] = [str(repository_id)]
+        if unique_symbol_ids:
+            placeholders = ", ".join("?" for _ in unique_symbol_ids)
+            clauses.append(f"symbol_id IN ({placeholders})")
+            parameters.extend(str(symbol_id) for symbol_id in unique_symbol_ids)
+        if unique_paths:
+            placeholders = ", ".join("?" for _ in unique_paths)
+            clauses.append(
+                f"(relative_path IN ({placeholders}) "
+                "AND kind IN ('file', 'test_file', 'module'))"
+            )
+            parameters.extend(unique_paths)
+        if not clauses:
+            return []
+
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    repository_id,
+                    kind,
+                    qualified_name,
+                    name,
+                    relative_path,
+                    start_line,
+                    end_line,
+                    symbol_id,
+                    language
+                FROM graph_nodes
+                WHERE repository_id = ? AND ({' OR '.join(clauses)})
+                ORDER BY relative_path, kind, qualified_name, id
+                """,
+                parameters,
+            ).fetchall()
+        return [_graph_node_from_row(row) for row in rows]
+
+    def load_graph_adjacency(
+        self,
+        repository_id: uuid.UUID,
+        node_ids: Iterable[uuid.UUID],
+        *,
+        edge_kinds: Iterable[str],
+        directions: Iterable[str],
+        minimum_confidence: float,
+        maximum_neighbors_per_node: int,
+    ) -> list[StoredGraphNeighbor]:
+        """Load bounded incoming and outgoing adjacency in stable order."""
+
+        unique_node_ids = list(dict.fromkeys(node_ids))
+        unique_edge_kinds = list(dict.fromkeys(edge_kinds))
+        unique_directions = list(dict.fromkeys(directions))
+        if not unique_node_ids or not unique_edge_kinds:
+            return []
+        if any(direction not in {"incoming", "outgoing"} for direction in unique_directions):
+            raise ValueError("Graph direction must be incoming or outgoing")
+        if not 0.0 <= minimum_confidence <= 1.0:
+            raise ValueError("minimum_confidence must be between 0 and 1")
+        if maximum_neighbors_per_node < 1:
+            raise ValueError("maximum_neighbors_per_node must be greater than 0")
+
+        node_placeholders = ", ".join("?" for _ in unique_node_ids)
+        kind_placeholders = ", ".join("?" for _ in unique_edge_kinds)
+        neighbors: list[StoredGraphNeighbor] = []
+        counts: dict[str, int] = {}
+        with self.read_connection() as connection:
+            for direction in unique_directions:
+                current_column = (
+                    "source_node_id" if direction == "outgoing" else "target_node_id"
+                )
+                neighbor_column = (
+                    "target_node_id" if direction == "outgoing" else "source_node_id"
+                )
+                rows = connection.execute(
+                    f"""
+                    WITH ranked_neighbors AS (
+                        SELECT
+                            id,
+                            {current_column} AS current_node_id,
+                            {neighbor_column} AS neighbor_node_id,
+                            kind,
+                            confidence,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY {current_column}
+                                ORDER BY
+                                    confidence DESC,
+                                    kind,
+                                    {neighbor_column},
+                                    id
+                            ) AS neighbor_rank
+                        FROM graph_edges
+                        WHERE repository_id = ?
+                            AND {current_column} IN ({node_placeholders})
+                            AND kind IN ({kind_placeholders})
+                            AND confidence >= ?
+                    )
+                    SELECT
+                        id,
+                        current_node_id,
+                        neighbor_node_id,
+                        kind,
+                        confidence
+                    FROM ranked_neighbors
+                    WHERE neighbor_rank <= ?
+                    ORDER BY
+                        current_node_id,
+                        confidence DESC,
+                        kind,
+                        neighbor_node_id,
+                        id
+                    """,
+                    [
+                        str(repository_id),
+                        *(str(node_id) for node_id in unique_node_ids),
+                        *unique_edge_kinds,
+                        minimum_confidence,
+                        maximum_neighbors_per_node,
+                    ],
+                ).fetchall()
+                for row in rows:
+                    current_id = row["current_node_id"]
+                    count = counts.get(current_id, 0)
+                    if count >= maximum_neighbors_per_node:
+                        continue
+                    counts[current_id] = count + 1
+                    neighbors.append(
+                        StoredGraphNeighbor(
+                            edge_id=uuid.UUID(row["id"]),
+                            current_node_id=uuid.UUID(current_id),
+                            neighbor_node_id=uuid.UUID(row["neighbor_node_id"]),
+                            kind=row["kind"],
+                            direction=direction,
+                            confidence=float(row["confidence"]),
+                        )
+                    )
+        return neighbors
+
+    def load_graph_results(
+        self,
+        repository_id: uuid.UUID,
+        node_ids: Iterable[uuid.UUID],
+        *,
+        max_snippet_chars: int,
+        path_filter: str | None = None,
+    ) -> dict[uuid.UUID, StoredGraphResult]:
+        """Map expanded graph nodes to bounded retrievable records."""
+
+        unique_node_ids = list(dict.fromkeys(node_ids))
+        if not unique_node_ids:
+            return {}
+        if max_snippet_chars < 1:
+            raise ValueError("max_snippet_chars must be greater than 0")
+        placeholders = ", ".join("?" for _ in unique_node_ids)
+        path_clause = ""
+        path_parameters: list[str] = []
+        if path_filter is not None:
+            path_clause, path_parameters = _path_filter_clause(
+                "n.relative_path",
+                path_filter,
+            )
+        common_parameters: list[str | int] = [
+            max_snippet_chars + 1,
+            str(repository_id),
+            *(str(node_id) for node_id in unique_node_ids),
+            *path_parameters,
+        ]
+
+        results: dict[uuid.UUID, StoredGraphResult] = {}
+        with self.read_connection() as connection:
+            symbol_rows = connection.execute(
+                f"""
+                SELECT
+                    n.id AS node_id,
+                    s.id AS record_id,
+                    'symbol' AS result_type,
+                    NULL AS semantic_unit_kind,
+                    s.language,
+                    s.relative_path,
+                    s.name,
+                    s.qualified_name,
+                    s.start_line,
+                    s.end_line,
+                    substr(s.source_snippet, 1, ?) AS snippet,
+                    s.id AS symbol_id
+                FROM graph_nodes AS n
+                JOIN symbols AS s ON s.id = n.symbol_id
+                WHERE n.repository_id = ?
+                    AND n.id IN ({placeholders})
+                    {path_clause}
+                """,
+                common_parameters,
+            ).fetchall()
+            for row in symbol_rows:
+                result = _graph_result_from_row(row)
+                results[result.node_id] = result
+
+            chunk_rows = connection.execute(
+                f"""
+                SELECT
+                    n.id AS node_id,
+                    c.id AS record_id,
+                    'chunk' AS result_type,
+                    c.semantic_unit_kind,
+                    c.language,
+                    c.relative_path,
+                    s.name,
+                    s.qualified_name,
+                    c.start_line,
+                    c.end_line,
+                    substr(c.raw_text, 1, ?) AS snippet,
+                    c.symbol_id
+                FROM graph_nodes AS n
+                JOIN chunks AS c ON c.id = (
+                    SELECT candidate.id
+                    FROM chunks AS candidate
+                    WHERE candidate.repository_id = n.repository_id
+                        AND candidate.relative_path = n.relative_path
+                    ORDER BY
+                        CASE candidate.semantic_unit_kind
+                            WHEN 'imports' THEN 0
+                            WHEN 'module_code' THEN 1
+                            ELSE 2
+                        END,
+                        candidate.start_line,
+                        candidate.end_line,
+                        candidate.id
+                    LIMIT 1
+                )
+                LEFT JOIN symbols AS s ON s.id = c.symbol_id
+                WHERE n.repository_id = ?
+                    AND n.id IN ({placeholders})
+                    AND n.symbol_id IS NULL
+                    AND n.kind IN ('file', 'test_file', 'module')
+                    {path_clause}
+                """,
+                common_parameters,
+            ).fetchall()
+            for row in chunk_rows:
+                result = _graph_result_from_row(row)
+                results[result.node_id] = result
+        return results
 
     def exact_search_symbols(
         self,
@@ -1530,6 +2068,16 @@ class SQLiteIndexStore:
         relative_path: str,
     ) -> None:
         connection.execute(
+            "DELETE FROM graph_facts "
+            "WHERE repository_id = ? AND source_file = ?",
+            (repository_id, relative_path),
+        )
+        connection.execute(
+            "DELETE FROM graph_nodes "
+            "WHERE repository_id = ? AND relative_path = ?",
+            (repository_id, relative_path),
+        )
+        connection.execute(
             "DELETE FROM lexical_documents "
             "WHERE repository_id = ? AND relative_path = ?",
             (repository_id, relative_path),
@@ -1739,6 +2287,149 @@ class SQLiteIndexStore:
             ],
         )
 
+    @staticmethod
+    def _insert_graph_nodes(
+        connection: sqlite3.Connection,
+        nodes: list[GraphNode],
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO graph_nodes (
+                id,
+                repository_id,
+                kind,
+                qualified_name,
+                name,
+                relative_path,
+                start_line,
+                end_line,
+                symbol_id,
+                language
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                qualified_name = excluded.qualified_name,
+                name = excluded.name,
+                relative_path = excluded.relative_path,
+                start_line = excluded.start_line,
+                end_line = excluded.end_line,
+                symbol_id = excluded.symbol_id,
+                language = excluded.language
+            """,
+            [
+                (
+                    str(node.id),
+                    str(node.repository_id),
+                    node.kind,
+                    node.qualified_name,
+                    node.name,
+                    node.relative_path,
+                    node.start_line,
+                    node.end_line,
+                    str(node.symbol_id) if node.symbol_id is not None else None,
+                    node.language,
+                )
+                for node in nodes
+            ],
+        )
+
+    @staticmethod
+    def _insert_graph_facts(
+        connection: sqlite3.Connection,
+        facts: list[GraphFact],
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO graph_facts (
+                id,
+                repository_id,
+                source_node_id,
+                kind,
+                source_reference,
+                target_reference,
+                source_scope,
+                source_file,
+                start_line,
+                end_line,
+                extraction_adapter,
+                adapter_version,
+                confidence,
+                target_kind,
+                target_qualified_hint,
+                hint_resolution_method,
+                evidence_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(fact.id),
+                    str(fact.repository_id),
+                    str(fact.source_node_id),
+                    fact.kind,
+                    fact.source_reference,
+                    fact.target_reference,
+                    fact.source_scope,
+                    fact.source_file,
+                    fact.start_line,
+                    fact.end_line,
+                    fact.extraction_adapter,
+                    fact.adapter_version,
+                    fact.confidence,
+                    fact.target_kind,
+                    fact.target_qualified_hint,
+                    fact.hint_resolution_method,
+                    fact.evidence_text,
+                )
+                for fact in facts
+            ],
+        )
+
+    @staticmethod
+    def _insert_graph_edges(
+        connection: sqlite3.Connection,
+        edges: list[GraphEdge],
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO graph_edges (
+                id,
+                repository_id,
+                source_node_id,
+                target_node_id,
+                kind,
+                source_file,
+                start_line,
+                end_line,
+                extraction_adapter,
+                adapter_version,
+                resolution_method,
+                confidence,
+                evidence_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str(edge.id),
+                    str(edge.repository_id),
+                    str(edge.source_node_id),
+                    str(edge.target_node_id),
+                    edge.kind,
+                    edge.source_file,
+                    edge.start_line,
+                    edge.end_line,
+                    edge.extraction_adapter,
+                    edge.adapter_version,
+                    edge.resolution_method,
+                    edge.confidence,
+                    edge.evidence_text,
+                )
+                for edge in edges
+            ],
+        )
+
 
 def _repository_from_row(row: sqlite3.Row) -> Repository:
     """Build a Repository model from a SQLite row."""
@@ -1751,6 +2442,78 @@ def _repository_from_row(row: sqlite3.Row) -> Repository:
         embedding_provider=row["embedding_provider"],
         embedding_model=row["embedding_model"],
         embedding_dim=row["embedding_dim"],
+    )
+
+
+def _graph_node_from_row(row: sqlite3.Row) -> GraphNode:
+    return GraphNode(
+        id=uuid.UUID(row["id"]),
+        repository_id=uuid.UUID(row["repository_id"]),
+        kind=row["kind"],
+        qualified_name=row["qualified_name"],
+        name=row["name"],
+        relative_path=row["relative_path"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        symbol_id=(uuid.UUID(row["symbol_id"]) if row["symbol_id"] else None),
+        language=row["language"],
+    )
+
+
+def _graph_fact_from_row(row: sqlite3.Row) -> GraphFact:
+    return GraphFact(
+        id=uuid.UUID(row["id"]),
+        repository_id=uuid.UUID(row["repository_id"]),
+        source_node_id=uuid.UUID(row["source_node_id"]),
+        kind=row["kind"],
+        source_reference=row["source_reference"],
+        target_reference=row["target_reference"],
+        source_scope=row["source_scope"],
+        source_file=row["source_file"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        extraction_adapter=row["extraction_adapter"],
+        adapter_version=row["adapter_version"],
+        confidence=float(row["confidence"]),
+        target_kind=row["target_kind"],
+        target_qualified_hint=row["target_qualified_hint"],
+        hint_resolution_method=row["hint_resolution_method"],
+        evidence_text=row["evidence_text"],
+    )
+
+
+def _graph_edge_from_row(row: sqlite3.Row) -> GraphEdge:
+    return GraphEdge(
+        id=uuid.UUID(row["id"]),
+        repository_id=uuid.UUID(row["repository_id"]),
+        source_node_id=uuid.UUID(row["source_node_id"]),
+        target_node_id=uuid.UUID(row["target_node_id"]),
+        kind=row["kind"],
+        source_file=row["source_file"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        extraction_adapter=row["extraction_adapter"],
+        adapter_version=row["adapter_version"],
+        resolution_method=row["resolution_method"],
+        confidence=float(row["confidence"]),
+        evidence_text=row["evidence_text"],
+    )
+
+
+def _graph_result_from_row(row: sqlite3.Row) -> StoredGraphResult:
+    return StoredGraphResult(
+        node_id=uuid.UUID(row["node_id"]),
+        record_id=uuid.UUID(row["record_id"]),
+        result_type=row["result_type"],
+        semantic_unit_kind=row["semantic_unit_kind"],
+        language=row["language"],
+        relative_path=row["relative_path"],
+        name=row["qualified_name"] or row["name"],
+        qualified_name=row["qualified_name"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        snippet=row["snippet"],
+        symbol_id=(uuid.UUID(row["symbol_id"]) if row["symbol_id"] else None),
     )
 
 
@@ -1778,6 +2541,7 @@ def _path_filter_clause(column: str, path_filter: str) -> tuple[str, list[str]]:
         "relative_path",
         "chunks.relative_path",
         "lexical_documents.relative_path",
+        "n.relative_path",
     }
     if column not in allowed_columns:
         raise ValueError(f"Unsupported path filter column: {column}")
