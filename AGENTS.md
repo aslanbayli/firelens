@@ -1,8 +1,6 @@
 # FireLens Agent Instructions
 
-Read `PLAN.md` and `SPEC.md` before making architectural changes.
-
-FireLens 2 is a local-first code retrieval engine. It is not a chatbot.
+FireLens is a local-first code retrieval engine. It is not a chatbot.
 Retrieval, ranking, indexing, and storage are the product.
 
 Python owns ingestion, parsing, persistence, query routing, result formatting,
@@ -20,10 +18,16 @@ correctness, performance, or maintainability.
 Keep storage behind repository or store classes. Search and indexing
 orchestration code must not contain raw SQL.
 
-Do not route new FireLens 2 behavior through legacy GitHub or LLM modules.
+Do not route new FireLens behavior through legacy GitHub or LLM modules.
 
 ## Commit message suggestions
 
-When asked to provide a commit name/title, use a Conventional Commits-style prefix such as `feat:`, `fix:`, `chore:`, `docs:`, `test:`, or `refactor:`. Choose the prefix that best matches the change, and keep the title concise.
+Always provide a commit name/title, use a Conventional Commits-style prefix such as `feat:`, `fix:`, `chore:`, `docs:`, `test:`, or `refactor:`. Choose the prefix that best matches the change, and keep the title concise.
 
 When making commits NEVER add your agent name as a contributor.
+
+## Important rules
+
+Never commit docs/ directory
+
+Always create a new branch when working on a new feature and make commits with proper title and description for each implemented significant step
