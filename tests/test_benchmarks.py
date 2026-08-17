@@ -125,6 +125,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(config.semantic_dimension, 768)
         self.assertEqual(config.fuzzy_sizes, (128, 512))
         self.assertEqual(config.exact_sizes, (10_000, 50_000, 100_000))
+        self.assertEqual(config.fusion_sizes, (40,))
         self.assertEqual(config.warmups, 5)
         self.assertEqual(config.runs, 30)
 
@@ -150,7 +151,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(
             report["summary"],
             {
-                "case_count": 3,
+                "case_count": 5,
                 "compared_case_count": 3,
                 "parity_passed_count": 3,
                 "all_compared_cases_passed": True,
@@ -158,7 +159,11 @@ class BenchmarkTests(unittest.TestCase):
             },
         )
         self.assertTrue(
-            all(case["parity"]["passed"] for case in report["cases"])
+            all(
+                case["parity"]["passed"]
+                for case in report["cases"]
+                if case["comparison"] is not None
+            )
         )
         self.assertTrue(
             all(
@@ -166,11 +171,19 @@ class BenchmarkTests(unittest.TestCase):
                 for case in report["cases"]
             )
         )
-        self.assertEqual(len(report["comparison_table"]), 3)
+        self.assertEqual(len(report["comparison_table"]), 5)
         markdown_table = format_markdown_table(report)
         self.assertIn("| semantic | 8 |", markdown_table)
         self.assertIn("| fuzzy | 8 |", markdown_table)
         self.assertIn("| exact | 16 |", markdown_table)
+        self.assertIn("| hybrid_rrf | 40 |", markdown_table)
+        self.assertIn("| hybrid_weighted | 40 |", markdown_table)
+        fusion_cases = [
+            case for case in report["cases"] if case["operation"].startswith("hybrid")
+        ]
+        self.assertTrue(
+            all(case["parameters"]["interop_bytes"] == 0 for case in fusion_cases)
+        )
 
     def test_report_records_missing_comparison_backend(self) -> None:
         report = run_benchmarks(

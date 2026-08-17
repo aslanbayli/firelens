@@ -296,6 +296,10 @@ class McpInMemoryContractTests(unittest.IsolatedAsyncioTestCase):
 
         search_input = tools["search_code"].input_schema["properties"]
         self.assertEqual(search_input["mode"]["default"], "auto")
+        self.assertTrue(
+            {"hybrid_rrf", "hybrid_weighted"}
+            <= set(search_input["mode"]["enum"])
+        )
         self.assertEqual(search_input["query"]["maxLength"], 2_000)
         self.assertEqual(search_input["top_k"]["maximum"], 20)
         self.assertEqual(search_input["max_snippet_chars"]["maximum"], 4_000)
@@ -460,6 +464,35 @@ class McpStdioContractTests(unittest.TestCase):
                 self.assertEqual(
                     search_result.structured_content["ranked_results"][0]["file_path"],
                     "example.py",
+                )
+
+                hybrid_result = await client.call_tool(
+                    "search_code",
+                    {
+                        "repository_path": str(repository),
+                        "query": "function returning a value",
+                        "mode": "hybrid_rrf",
+                        "backend": "python",
+                    },
+                )
+                self.assertFalse(hybrid_result.is_error)
+                self.assertEqual(
+                    hybrid_result.structured_content["mode"],
+                    "hybrid_rrf",
+                )
+                self.assertTrue(
+                    hybrid_result.structured_content["retrieval_config"].startswith(
+                        "hybrid_rrf:"
+                    )
+                )
+                self.assertEqual(
+                    [
+                        timing["component"]
+                        for timing in hybrid_result.structured_content[
+                            "retrieval_timings"
+                        ]
+                    ],
+                    ["lexical", "semantic", "fusion"],
                 )
 
                 invalid_result = await client.call_tool(
