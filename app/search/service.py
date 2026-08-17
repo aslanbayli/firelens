@@ -37,6 +37,7 @@ from app.search.hybrid import (
 from app.search.lexical import LexicalSearchConfig, lexical_search
 from app.search.router import classify_non_exact_query
 from app.search.semantic import (
+    SEMANTIC_RANKING_VERSION,
     SemanticSearchIndex,
     load_semantic_search_index,
     semantic_search,
@@ -905,7 +906,10 @@ def _retrieval_config_identity(settings: Settings) -> str:
         "fuzzy_threshold": settings.fuzzy_threshold,
         "max_fuzzy_candidates": settings.max_fuzzy_candidates,
         "max_semantic_candidates": settings.max_semantic_candidates,
-        "semantic_score_floor": settings.semantic_score_floor,
+        "semantic": {
+            "score_floor": settings.semantic_score_floor,
+            "ranking_version": SEMANTIC_RANKING_VERSION,
+        },
         "hybrid": {
             "lexical_pool_size": settings.hybrid_lexical_pool_size,
             "semantic_pool_size": settings.hybrid_semantic_pool_size,

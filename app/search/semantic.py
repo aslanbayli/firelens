@@ -29,6 +29,33 @@ class SemanticSearchIndex:
 
 _PYTHON_BACKEND = PythonBackend()
 
+SEMANTIC_RANKING_VERSION = "context-v1"
+
+# Semantic chunks are intentionally fine-grained so comments and docstrings can
+# act as strong matching evidence. Ranking more matches than the caller requests
+# leaves room to collapse those overlapping chunks into one useful result.
+_MATCH_POOL_FACTOR = 8
+
+# A symbol-owned match can be returned with complete declaration context. Small
+# module-level fragments cannot, so near-ties should prefer the contextualized
+# result and keep imports or isolated comments as fallback evidence.
+_SYMBOL_CONTEXT_BONUS = 0.03
+_LOW_CONTEXT_PENALTIES = {
+    "imports": 0.08,
+    "module_comment": 0.05,
+}
+
+
+@dataclass(frozen=True)
+class _RankedSemanticMatch:
+    """One vector match with its public relevance and stable source rank."""
+
+    candidate: StoredSemanticCandidate
+    source_rank: int
+    raw_score: float
+    similarity_score: float
+    relevance_score: float
+
 
 def load_semantic_search_index(
     store: SQLiteIndexStore,
@@ -275,15 +302,17 @@ def semantic_search(
     )
 
     # Embeddings are validated as finite, nonzero unit vectors before storage.
-    # The selected backend owns the final contiguous-array boundary checks.
+    # Rank a larger evidence pool because several high-scoring chunks may belong
+    # to the same symbol and will collapse into one returned result.
     raise_if_cancelled(cancellation_callback)
+    match_limit = min(len(candidates), result_limit * _MATCH_POOL_FACTOR)
     active_backend = backend
     warnings: list[str] = []
     try:
         ranked_scores = active_backend.semantic_top_k(
             matrix,
             normalized_query,
-            result_limit,
+            match_limit,
         )
     except AccelerationError:
         if fallback_backend is None:
@@ -292,60 +321,106 @@ def semantic_search(
         ranked_scores = active_backend.semantic_top_k(
             matrix,
             normalized_query,
-            result_limit,
+            match_limit,
         )
         warnings.append("Mojo semantic acceleration failed; using Python")
     raise_if_cancelled(cancellation_callback)
-    selected_indices = ranked_scores.indices
-    selected_candidates = [candidates[int(index)] for index in selected_indices]
+
+    matches = _ranked_semantic_matches(
+        candidates,
+        ranked_scores.indices,
+        ranked_scores.scores,
+    )
+    selected_matches = _select_semantic_matches(
+        matches,
+        result_limit=result_limit,
+        score_floor=score_floor,
+    )
+
+    selected_symbol_ids = [
+        match.candidate.symbol_id
+        for match in selected_matches
+        if match.candidate.symbol_id is not None
+    ]
+    symbols_by_id = store.load_symbols_by_ids(
+        selected_symbol_ids,
+        max_snippet_chars=request.max_snippet_chars,
+    )
+    selected_chunk_ids = [
+        match.candidate.chunk_id
+        for match in selected_matches
+        if match.candidate.symbol_id is None
+    ]
     chunk_texts = store.load_chunk_texts(
-        (candidate.chunk_id for candidate in selected_candidates),
+        selected_chunk_ids,
         max_chars=request.max_snippet_chars,
     )
     raise_if_cancelled(cancellation_callback)
 
     results: list[SearchResult] = []
-    for raw_score, candidate in zip(
-        ranked_scores.scores,
-        selected_candidates,
-        strict=True,
-    ):
+    for result_rank, match in enumerate(selected_matches, start=1):
         raise_if_cancelled(cancellation_callback)
-        raw_text = chunk_texts.get(candidate.chunk_id)
-        if raw_text is None:
-            raise ValueError("Ranked semantic chunk was not found")
-        snippet = raw_text[: request.max_snippet_chars]
-
-        public_score = float(np.clip((float(raw_score) + 1.0) / 2.0, 0.0, 1.0))
-        if score_floor is not None and public_score < score_floor:
-            continue
-
-        results.append(
-            SearchResult(
-                id=candidate.chunk_id,
-                result_type="chunk",
-                file_path=candidate.relative_path,
-                start_line=candidate.start_line,
-                end_line=candidate.end_line,
-                symbol_name=bounded_symbol_name(candidate.qualified_symbol_name),
-                symbol_id=candidate.symbol_id,
-                language=candidate.language,
-                semantic_unit_kind=candidate.semantic_unit_kind,
+        candidate = match.candidate
+        if candidate.symbol_id is not None:
+            symbol = symbols_by_id.get(candidate.symbol_id)
+            if symbol is None:
+                raise ValueError("Ranked semantic symbol was not found")
+            snippet = symbol.source_snippet[: request.max_snippet_chars]
+            result = SearchResult(
+                id=symbol.id,
+                result_type="symbol",
+                file_path=symbol.relative_path,
+                start_line=symbol.start_line,
+                end_line=symbol.end_line,
+                symbol_name=bounded_symbol_name(symbol.qualified_name),
+                symbol_id=symbol.id,
+                language=symbol.language,
                 snippet=snippet,
-                snippet_truncated=len(snippet) < len(raw_text),
-                score=public_score,
+                snippet_truncated=len(snippet) < len(symbol.source_snippet),
+                score=match.relevance_score,
                 mode="semantic",
                 backend=active_backend.name,
                 retrieval_channels=["semantic"],
                 retrieval_evidence=[
                     {
                         "channel": "semantic",
-                        "score": public_score,
-                        "rank": len(results) + 1,
+                        "score": match.relevance_score,
+                        "rank": result_rank,
+                        "raw_score": match.raw_score,
                     }
                 ],
             )
-        )
+        else:
+            raw_text = chunk_texts.get(candidate.chunk_id)
+            if raw_text is None:
+                raise ValueError("Ranked semantic chunk was not found")
+            snippet = raw_text[: request.max_snippet_chars]
+            result = SearchResult(
+                id=candidate.chunk_id,
+                result_type="chunk",
+                file_path=candidate.relative_path,
+                start_line=candidate.start_line,
+                end_line=candidate.end_line,
+                symbol_name=bounded_symbol_name(candidate.qualified_symbol_name),
+                language=candidate.language,
+                semantic_unit_kind=candidate.semantic_unit_kind,
+                snippet=snippet,
+                snippet_truncated=len(snippet) < len(raw_text),
+                score=match.relevance_score,
+                mode="semantic",
+                backend=active_backend.name,
+                retrieval_channels=["semantic"],
+                retrieval_evidence=[
+                    {
+                        "channel": "semantic",
+                        "score": match.relevance_score,
+                        "rank": result_rank,
+                        "raw_score": match.raw_score,
+                    }
+                ],
+            )
+
+        results.append(result)
 
     return SearchResponse(
         original_query=request.query,
@@ -356,4 +431,99 @@ def semantic_search(
         elapsed_time=time.perf_counter() - start_time,
         ranked_results=results,
         warnings=warnings,
+    )
+
+
+def _ranked_semantic_matches(
+    candidates: list[StoredSemanticCandidate],
+    ranked_indices: np.ndarray,
+    raw_scores: np.ndarray,
+) -> list[_RankedSemanticMatch]:
+    """Attach context-aware public relevance to backend-ranked matches."""
+
+    matches: list[_RankedSemanticMatch] = []
+    for source_rank, (index, raw_score_value) in enumerate(
+        zip(ranked_indices, raw_scores, strict=True),
+        start=1,
+    ):
+        candidate = candidates[int(index)]
+        raw_score = float(raw_score_value)
+        similarity_score = float(np.clip((raw_score + 1.0) / 2.0, 0.0, 1.0))
+        relevance_score = _contextual_relevance_score(
+            candidate,
+            similarity_score,
+        )
+        matches.append(
+            _RankedSemanticMatch(
+                candidate=candidate,
+                source_rank=source_rank,
+                raw_score=raw_score,
+                similarity_score=similarity_score,
+                relevance_score=relevance_score,
+            )
+        )
+    return matches
+
+
+def _contextual_relevance_score(
+    candidate: StoredSemanticCandidate,
+    similarity_score: float,
+) -> float:
+    """Prefer matches that can be presented with useful source context."""
+
+    if candidate.symbol_id is not None:
+        adjustment = _SYMBOL_CONTEXT_BONUS
+    else:
+        adjustment = -_LOW_CONTEXT_PENALTIES.get(
+            candidate.semantic_unit_kind,
+            0.0,
+        )
+    return float(np.clip(similarity_score + adjustment, 0.0, 1.0))
+
+
+def _select_semantic_matches(
+    matches: list[_RankedSemanticMatch],
+    *,
+    result_limit: int,
+    score_floor: float | None,
+) -> list[_RankedSemanticMatch]:
+    """Collapse symbol-owned evidence and return deterministic best matches."""
+
+    best_by_identity: dict[tuple[str, uuid.UUID], _RankedSemanticMatch] = {}
+    for match in matches:
+        identity = _semantic_match_identity(match.candidate)
+        current = best_by_identity.get(identity)
+        if current is None or _semantic_match_sort_key(
+            match
+        ) < _semantic_match_sort_key(current):
+            best_by_identity[identity] = match
+
+    ranked = sorted(best_by_identity.values(), key=_semantic_match_sort_key)
+    if score_floor is not None:
+        ranked = [
+            match for match in ranked if match.relevance_score >= score_floor
+        ]
+    return ranked[:result_limit]
+
+
+def _semantic_match_identity(
+    candidate: StoredSemanticCandidate,
+) -> tuple[str, uuid.UUID]:
+    if candidate.symbol_id is not None:
+        return "symbol", candidate.symbol_id
+    return "chunk", candidate.chunk_id
+
+
+def _semantic_match_sort_key(
+    match: _RankedSemanticMatch,
+) -> tuple[float, float, int, str, int, int, str]:
+    candidate = match.candidate
+    return (
+        -match.relevance_score,
+        -match.similarity_score,
+        match.source_rank,
+        candidate.relative_path,
+        candidate.start_line,
+        candidate.end_line,
+        str(candidate.chunk_id),
     )
