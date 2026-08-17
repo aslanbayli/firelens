@@ -12,6 +12,7 @@ from app.core.cancellation import CancellationCallback, raise_if_cancelled
 from app.core.models import SearchRequest, SearchResponse, SearchResult
 from app.indexing.embedder import Embedder
 from app.search.limits import bounded_symbol_name
+from app.search.relevance import is_result_kind_requested
 from app.storage.database import (
     SQLiteIndexStore,
     SemanticCandidateSummary,
@@ -29,21 +30,16 @@ class SemanticSearchIndex:
 
 _PYTHON_BACKEND = PythonBackend()
 
-SEMANTIC_RANKING_VERSION = "context-v1"
+SEMANTIC_RANKING_VERSION = "context-v2"
 
 # Semantic chunks are intentionally fine-grained so comments and docstrings can
-# act as strong matching evidence. Ranking more matches than the caller requests
-# leaves room to collapse those overlapping chunks into one useful result.
+# support symbol context or targeted searches. Ranking more matches than the
+# caller requests leaves room to collapse overlapping chunks into one result.
 _MATCH_POOL_FACTOR = 8
 
-# A symbol-owned match can be returned with complete declaration context. Small
-# module-level fragments cannot, so near-ties should prefer the contextualized
-# result and keep imports or isolated comments as fallback evidence.
+# A symbol-owned match can be returned with complete declaration context, so
+# prefer it when vector similarities are close.
 _SYMBOL_CONTEXT_BONUS = 0.03
-_LOW_CONTEXT_PENALTIES = {
-    "imports": 0.08,
-    "module_comment": 0.05,
-}
 
 
 @dataclass(frozen=True)
@@ -333,6 +329,7 @@ def semantic_search(
     )
     selected_matches = _select_semantic_matches(
         matches,
+        query=query,
         result_limit=result_limit,
         score_floor=score_floor,
     )
@@ -474,23 +471,29 @@ def _contextual_relevance_score(
     if candidate.symbol_id is not None:
         adjustment = _SYMBOL_CONTEXT_BONUS
     else:
-        adjustment = -_LOW_CONTEXT_PENALTIES.get(
-            candidate.semantic_unit_kind,
-            0.0,
-        )
+        adjustment = 0.0
     return float(np.clip(similarity_score + adjustment, 0.0, 1.0))
 
 
 def _select_semantic_matches(
     matches: list[_RankedSemanticMatch],
     *,
+    query: str,
     result_limit: int,
     score_floor: float | None,
 ) -> list[_RankedSemanticMatch]:
-    """Collapse symbol-owned evidence and return deterministic best matches."""
+    """Drop unrequested fragments and collapse symbol-owned evidence."""
 
     best_by_identity: dict[tuple[str, uuid.UUID], _RankedSemanticMatch] = {}
     for match in matches:
+        if (
+            match.candidate.symbol_id is None
+            and not is_result_kind_requested(
+                query,
+                match.candidate.semantic_unit_kind,
+            )
+        ):
+            continue
         identity = _semantic_match_identity(match.candidate)
         current = best_by_identity.get(identity)
         if current is None or _semantic_match_sort_key(

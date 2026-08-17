@@ -16,6 +16,7 @@ from app.core.models import (
 from app.indexing.adapters import DEFAULT_ADAPTER_REGISTRY
 from app.search.fuzzy import fuzzy_search
 from app.search.limits import bounded_symbol_name
+from app.search.relevance import is_result_kind_requested
 from app.storage.database import (
     SQLiteIndexStore,
     SearchCandidateLimitError,
@@ -282,7 +283,14 @@ def lexical_search(
                 config.maximum_documents_ranked,
             )
 
-    ranked = [_finalize_result(item) for item in merged.values()]
+    ranked = [
+        _finalize_result(item)
+        for item in merged.values()
+        if is_result_kind_requested(
+            query,
+            item.result.semantic_unit_kind,
+        )
+    ]
     ranked.sort(key=_result_sort_key)
     return SearchResponse(
         original_query=request.query,

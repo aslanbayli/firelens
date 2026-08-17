@@ -145,7 +145,7 @@ class SemanticResultContextTests(unittest.TestCase):
         self.assertEqual(response.ranked_results[0].end_line, 14)
         self.assertIsNone(response.ranked_results[0].semantic_unit_kind)
 
-    def test_low_context_module_fragments_are_demoted(self) -> None:
+    def test_low_signal_fragments_require_explicit_query_intent(self) -> None:
         candidates = [
             _candidate(1, kind="imports", start_line=1),
             _candidate(2, kind="module_comment", start_line=5),
@@ -175,6 +175,55 @@ class SemanticResultContextTests(unittest.TestCase):
             response.ranked_results[0].score,
             response.ranked_results[1].score,
         )
+
+    def test_import_and_comment_queries_can_return_matching_fragments(self) -> None:
+        candidates = [
+            _candidate(1, kind="imports", start_line=1),
+            _candidate(2, kind="module_comment", start_line=5),
+        ]
+        chunk_texts = {
+            candidate.chunk_id: f"{candidate.semantic_unit_kind} content\n"
+            for candidate in candidates
+        }
+        search_index = _search_index(candidates, [0.90, 0.89])
+        store = SemanticStore([], chunk_texts)
+
+        imports_response = semantic_search(
+            store,
+            REPOSITORY_ID,
+            SearchRequest(query="where is this imported", request_mode="semantic"),
+            ControlledEmbedder(),
+            search_index=search_index,
+        )
+        comments_response = semantic_search(
+            store,
+            REPOSITORY_ID,
+            SearchRequest(query="find explanatory comments", request_mode="semantic"),
+            ControlledEmbedder(),
+            search_index=search_index,
+        )
+
+        self.assertEqual(
+            [result.semantic_unit_kind for result in imports_response.ranked_results],
+            ["imports"],
+        )
+        self.assertEqual(
+            [result.semantic_unit_kind for result in comments_response.ranked_results],
+            ["module_comment"],
+        )
+
+    def test_intent_terms_are_matched_as_words(self) -> None:
+        candidate = _candidate(1, kind="imports", start_line=1)
+
+        response = semantic_search(
+            SemanticStore([], {candidate.chunk_id: "import package\n"}),
+            REPOSITORY_ID,
+            SearchRequest(query="important behavior", request_mode="semantic"),
+            ControlledEmbedder(),
+            search_index=_search_index([candidate], [0.99]),
+        )
+
+        self.assertFalse(response.ranked_results)
 
 
 def _symbol(
