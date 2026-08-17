@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible problem in FireLens
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. For security vulnerabilities, use the private process in SECURITY.md instead.
+  - type: input
+    id: version
+    attributes:
+      label: FireLens version
+      description: Run `git describe --tags --always --dirty` in the FireLens checkout.
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the operating system, Python version, uv version, and MCP client when relevant.
+      placeholder: macOS 15, Python 3.14, uv 0.x, Codex
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe example that reproduces the problem.
+      placeholder: |
+        1. Configure FireLens with ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Paste bounded logs or JSON output with tokens, paths, and private code removed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed secrets and private source code from this report.
+          required: true
