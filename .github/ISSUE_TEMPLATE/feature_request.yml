@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an improvement to FireLens retrieval, indexing, or interfaces
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What retrieval or indexing problem should FireLens solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior and why it belongs in a local-first code retrieval engine.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or different designs have you considered?
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evaluation plan
+      description: Explain how correctness, retrieval quality, latency, or memory use could be measured.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: This proposal keeps FireLens focused on retrieval rather than chat behavior.
+          required: true
