@@ -124,6 +124,7 @@ class StoredSemanticCandidate:
     relative_path: str
     start_line: int
     end_line: int
+    symbol_id: uuid.UUID | None = None
     qualified_symbol_name: str | None = None
     language: str = "python"
     semantic_unit_kind: str = "symbol"
@@ -1295,6 +1296,7 @@ class SQLiteIndexStore:
                 f"""
                 SELECT
                     chunks.id,
+                    chunks.symbol_id,
                     chunks.relative_path,
                     chunks.start_line,
                     chunks.end_line,
@@ -1322,6 +1324,11 @@ class SQLiteIndexStore:
                 yield StoredSemanticCandidateRow(
                     candidate=StoredSemanticCandidate(
                         chunk_id=uuid.UUID(row["id"]),
+                        symbol_id=(
+                            uuid.UUID(row["symbol_id"])
+                            if row["symbol_id"] is not None
+                            else None
+                        ),
                         relative_path=row["relative_path"],
                         start_line=row["start_line"],
                         end_line=row["end_line"],

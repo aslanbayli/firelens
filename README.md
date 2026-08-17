@@ -6,7 +6,7 @@ Coding agents fail partly because they retrieve code that is textually similar b
 FireLens is a retrieval and inference benchmark for AI coding agents, with hybrid code search, graph-aware retrieval, MCP integration, and Mojo-accelerated hot paths.
 
 It indexes repository symbols, semantic chunks, and embeddings into SQLite so
-code can be retrieved with exact, fuzzy, or natural-language semantic search.
+code can be retrieved with exact, fuzzy, lexical, semantic, or hybrid search.
 FireLens is not a chatbot. Retrieval and indexing are the product.
 
 
@@ -16,9 +16,13 @@ FireLens is not a chatbot. Retrieval and indexing are the product.
 - SQLite-backed repository index storage
 - exact symbol-name search
 - fuzzy symbol-name search using normalized Levenshtein similarity
+- SQLite FTS5 lexical search with exact-name, path, identifier, BM25, and
+  typo-recovery evidence
 - semantic code search using normalized vector similarity
+- explicit reciprocal-rank-fusion and normalized-weighted hybrid modes
+- stable symbol/chunk deduplication, result provenance, and component timings
 - optional Mojo CPU kernels for fuzzy scoring and large semantic rankings
-- exact-first automatic routing between all three search modes
+- exact-first automatic routing across exact, fuzzy, and semantic search
 - local STDIO MCP tools for coding agents
 - JSON CLI for indexing, freshness checks, and search
 - Streamlit interface for indexing and all search modes
@@ -114,10 +118,52 @@ uv run firelens index ~/projects/firelens
 uv run firelens search ~/projects/firelens "SQLiteIndexStore" --mode auto
 uv run firelens search ~/projects/firelens "where are indexes persisted?" \
   --mode semantic --top-k 5 --path app/storage
+uv run firelens search ~/projects/firelens "where is authentication checked?" \
+  --mode hybrid_rrf --top-k 5
 ```
 
 Commands write structured JSON to stdout. Indexing progress and errors go to
 stderr, so stdout remains safe to pipe into another program.
+
+`--mode` accepts `auto`, `exact`, `fuzzy`, `lexical`, `semantic`,
+`hybrid_rrf`, and `hybrid_weighted`. `auto` intentionally retains its
+exact/fuzzy/semantic routing behavior; select a hybrid mode explicitly until
+evaluation data supports a calibrated default.
+
+## Retrieval modes and hybrid behavior
+
+`lexical` combines bounded exact qualified-name, exact short-name, path,
+identifier, BM25, and fuzzy-symbol candidate channels. Results retain the
+matching channels, normalized scores, and ranks so callers can see why a
+result matched.
+
+`semantic` ranks persisted code and documentation chunks by normalized vector
+similarity. It supports the same path filter as lexical retrieval.
+
+The two explicit hybrid modes generate bounded lexical and semantic pools from
+the same index snapshot, deduplicate matching records, symbols, and equivalent
+source spans, then apply a stable source-location tie break:
+
+- `hybrid_rrf` uses weighted reciprocal rank fusion. Its public scores are
+  normalized only after ranking.
+- `hybrid_weighted` min-max normalizes each source per query, then combines the
+  normalized values with configured lexical and semantic weights.
+
+Hybrid results include the fusion method, final score, lexical and semantic
+ranks and scores when present, inherited lexical evidence, per-component
+backend, and candidate-generation/fusion timings. An explicitly selected
+hybrid mode requires semantic retrieval: a semantic backend failure is
+reported as an error rather than silently returning lexical-only results.
+
+Defaults use pools of 20 lexical and 20 semantic candidates. Configure them
+with `FIRELENS_HYBRID_LEXICAL_POOL_SIZE` and
+`FIRELENS_HYBRID_SEMANTIC_POOL_SIZE`; the final result count remains controlled
+by `--top-k`. RRF controls are `FIRELENS_HYBRID_RRF_K`,
+`FIRELENS_HYBRID_RRF_LEXICAL_WEIGHT`, and
+`FIRELENS_HYBRID_RRF_SEMANTIC_WEIGHT`. Weighted fusion uses
+`FIRELENS_HYBRID_WEIGHTED_LEXICAL_WEIGHT`,
+`FIRELENS_HYBRID_WEIGHTED_SEMANTIC_WEIGHT`, and
+`FIRELENS_HYBRID_WEIGHTED_MISSING_SOURCE_VALUE`.
 
 ## Use FireLens as an MCP server
 
@@ -301,12 +347,14 @@ In the sidebar:
 
 1. Select an existing index or enter a new repository path.
 2. Click **Index / Re-index** when the repository needs indexing.
-3. Choose `auto`, `exact`, `fuzzy`, or `semantic` and a compute backend.
+3. Choose `auto`, `exact`, `fuzzy`, `lexical`, `semantic`, `hybrid_rrf`, or
+   `hybrid_weighted`, then select a compute backend.
 4. Enter a query and optionally restrict it to a repository-relative file or
    directory prefix.
 
 Use exact search for known symbol names, fuzzy search for partial or misspelled
-identifiers, and semantic search for natural-language questions such as:
+identifiers, lexical search for text, identifier, or path matches, and semantic
+or hybrid search for natural-language questions such as:
 
 ```text
 fuzzy search logic
@@ -343,6 +391,8 @@ The index contains:
 - `symbols`: parsed functions, classes, and methods
 - `chunks`: semantic-search source chunks
 - `embeddings`: serialized embedding vectors
+- `lexical_documents`: FTS5-backed lexical records for symbols, chunks, and
+  documentation
 
 ## Incremental indexing
 
@@ -427,7 +477,9 @@ most 512 symbol candidates; semantic search accepts at most 50,000 chunks
 and 192 MiB of vector data. Narrow the path filter when a repository exceeds a
 bound. The defaults can be reduced with `FIRELENS_MAX_FUZZY_CANDIDATES`,
 `FIRELENS_MAX_SEMANTIC_CANDIDATES`, and
-`FIRELENS_MAX_SEMANTIC_INDEX_BYTES`.
+`FIRELENS_MAX_SEMANTIC_INDEX_BYTES`. Hybrid candidate pools are independently
+bounded to 20 results per source before fusion, while final snippets and total
+context still use the normal output limits.
 
 ## Embeddings
 

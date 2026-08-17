@@ -22,8 +22,33 @@ SemanticUnitKind = Annotated[
 
 # ``RetrievalKind`` is the mode that actually produced a result. ``auto`` is
 # only a caller preference, so it belongs to ``RetrievalMode`` instead.
-RetrievalKind = Literal["exact", "fuzzy", "lexical", "semantic"]
-RetrievalMode = Literal["exact", "fuzzy", "lexical", "semantic", "auto"]
+RetrievalKind = Literal[
+    "exact",
+    "fuzzy",
+    "lexical",
+    "semantic",
+    "hybrid_rrf",
+    "hybrid_weighted",
+]
+RetrievalMode = Literal[
+    "exact",
+    "fuzzy",
+    "lexical",
+    "semantic",
+    "hybrid_rrf",
+    "hybrid_weighted",
+    "auto",
+]
+RETRIEVAL_MODE_OPTIONS = (
+    "auto",
+    "exact",
+    "fuzzy",
+    "lexical",
+    "semantic",
+    "hybrid_rrf",
+    "hybrid_weighted",
+)
+FusionMethod = Literal["rrf", "normalized_weighted"]
 BackendKind = Literal["python", "mojo"]
 BackendPreference = Literal["auto", "python", "mojo"]
 IndexStatus = Literal["missing", "ready", "stale", "indexing"]
@@ -115,6 +140,16 @@ class RetrievalEvidence(BaseModel):
     channel: Annotated[str, Field(min_length=1, max_length=64)]
     score: float = Field(ge=0.0, le=1.0)
     rank: int = Field(ge=1)
+    raw_score: float | None = Field(default=None, allow_inf_nan=False)
+    backend: BackendKind | None = None
+
+
+class RetrievalTiming(BaseModel):
+    """Bounded response-level timing for one retrieval component."""
+
+    component: Literal["lexical", "semantic", "fusion"]
+    elapsed_time: float = Field(ge=0.0, allow_inf_nan=False)
+    backend: BackendKind
 
 
 class SearchRequest(BaseModel):
@@ -157,6 +192,8 @@ class SearchResult(BaseModel):
     end_line: int
     # Available for symbol-owned results; absent for module-level chunks.
     symbol_name: Annotated[str, Field(max_length=4_096)] | None = None
+    # Stable owning symbol identity used to collapse symbol/chunk overlap.
+    symbol_id: uuid.UUID | None = None
     # Source language used by renderers and coding agents.
     language: str = "python"
     # Present for semantic-unit results and absent for standalone symbols.
@@ -169,6 +206,8 @@ class SearchResult(BaseModel):
     score: float = Field(ge=0.0, le=1.0)
     # Retrieval strategy that produced this result.
     mode: RetrievalKind
+    # Present only when independent retrieval channels were fused.
+    fusion_method: FusionMethod | None = None
     # Compute implementation that actually performed the relevant operation.
     backend: BackendKind
     # Ordered names of all channels that contributed to the public score.
@@ -197,6 +236,11 @@ class SearchResponse(BaseModel):
     ranked_results: list[SearchResult] = Field(max_length=20)
     # Non-fatal details such as falling back from Mojo to Python.
     warnings: list[str] = Field(default_factory=list)
+    # Candidate-generation and fusion timings, omitted for single-source modes.
+    retrieval_timings: list[RetrievalTiming] = Field(
+        default_factory=list,
+        max_length=3,
+    )
     # Stable name and hash for the effective retrieval calibration settings.
     retrieval_config: Annotated[str, Field(min_length=1, max_length=128)] = "default"
 

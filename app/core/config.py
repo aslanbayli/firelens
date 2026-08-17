@@ -3,6 +3,7 @@
 All defaults support local use without credentials or a ``.env`` file.
 """
 
+import math
 import os
 import sys
 from pathlib import Path
@@ -49,6 +50,7 @@ HARD_MAX_SEMANTIC_CANDIDATES = 50_000
 HARD_MAX_SEMANTIC_INDEX_BYTES = 256 * 1024 * 1024
 HARD_MAX_CHUNKS_PER_FILE = 4_096
 HARD_MAX_LEXICAL_CANDIDATES = 5_000
+HARD_MAX_HYBRID_POOL_SIZE = 20
 
 
 class Settings(BaseSettings):
@@ -122,6 +124,31 @@ class Settings(BaseSettings):
     bm25_path_weight: float = Field(default=2.0, ge=0.0)
     bm25_content_weight: float = Field(default=1.0, ge=0.0)
     semantic_score_floor: float | None = Field(default=None, ge=0.0, le=1.0)
+    hybrid_lexical_pool_size: int = Field(
+        default=20,
+        ge=1,
+        le=HARD_MAX_HYBRID_POOL_SIZE,
+    )
+    hybrid_semantic_pool_size: int = Field(
+        default=20,
+        ge=1,
+        le=HARD_MAX_HYBRID_POOL_SIZE,
+    )
+    hybrid_rrf_k: float = Field(default=60.0, gt=0.0)
+    hybrid_rrf_lexical_weight: float = Field(default=1.0, ge=0.0)
+    hybrid_rrf_semantic_weight: float = Field(default=1.0, ge=0.0)
+    hybrid_weighted_lexical_weight: float = Field(default=0.5, ge=0.0)
+    hybrid_weighted_semantic_weight: float = Field(default=0.5, ge=0.0)
+    hybrid_weighted_missing_source_value: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
+    hybrid_tie_breaking_version: str = Field(
+        default="source-location-v1",
+        min_length=1,
+        max_length=64,
+    )
     max_fuzzy_candidates: int = Field(
         default=512,
         ge=1,
@@ -204,6 +231,32 @@ class Settings(BaseSettings):
         if self.default_max_snippet_chars > self.max_snippet_chars:
             raise ValueError(
                 "default_max_snippet_chars must not exceed max_snippet_chars"
+            )
+        fusion_values = (
+            self.hybrid_rrf_k,
+            self.hybrid_rrf_lexical_weight,
+            self.hybrid_rrf_semantic_weight,
+            self.hybrid_weighted_lexical_weight,
+            self.hybrid_weighted_semantic_weight,
+            self.hybrid_weighted_missing_source_value,
+        )
+        if not all(math.isfinite(value) for value in fusion_values):
+            raise ValueError("hybrid fusion values must be finite")
+        if (
+            self.hybrid_rrf_lexical_weight
+            + self.hybrid_rrf_semantic_weight
+            <= 0.0
+        ):
+            raise ValueError(
+                "hybrid RRF source weights must sum to a positive value"
+            )
+        if (
+            self.hybrid_weighted_lexical_weight
+            + self.hybrid_weighted_semantic_weight
+            <= 0.0
+        ):
+            raise ValueError(
+                "hybrid weighted source weights must sum to a positive value"
             )
         return self
 
