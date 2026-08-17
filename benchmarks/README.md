@@ -25,11 +25,13 @@ The full profile uses five warm-ups and 30 measured iterations for:
 - Semantic ranking at 1,000, 10,000, and 50,000 rows with 768 dimensions.
 - Fuzzy scoring at 128 and 512 candidate pairs.
 - Exact matching at 10,000, 50,000, and 100,000 candidate pairs.
+- Hybrid RRF and normalized weighted fusion over a bounded 40-candidate pool.
 
 Use `--semantic-sizes`, `--semantic-dimension`, `--fuzzy-sizes`,
-`--exact-sizes`, `--warmups`, and `--runs` to define another profile. Each
-sizes option accepts comma-separated integers. Use `--operations` to select a
-comma-separated subset of `semantic`, `fuzzy`, and `exact`.
+`--exact-sizes`, `--fusion-sizes`, `--warmups`, and `--runs` to define another
+profile. Each sizes option accepts comma-separated integers. Use `--operations` to select a
+comma-separated subset of `semantic`, `fuzzy`, `exact`, `hybrid_rrf`, and
+`hybrid_weighted`.
 
 `--comparison-backend auto` records Mojo as skipped when its library is not
 available. `--comparison-backend mojo` treats an unavailable library as an
@@ -38,7 +40,9 @@ error. `--mojo-library` selects a specific compiled library.
 Every backend timing includes calls per second and candidate throughput. The
 JSON `comparison_table` contains one flattened, side-by-side row per case;
 `--table-output` writes the same median, p95, speedup, and parity columns as a
-Markdown table.
+Markdown table. Hybrid fusion is currently measured as a Python-only case; its
+parameters report candidate counts and zero interop bytes. A Mojo fusion kernel
+should be added only if profiling shows that this bounded work is material.
 
 The checked-in [CPU baseline](CPU_BASELINE.md) records the release-profile
 result used for the default automatic crossover thresholds. Treat those
