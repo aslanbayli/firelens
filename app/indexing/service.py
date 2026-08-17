@@ -214,6 +214,14 @@ class IndexService:
             warnings.append(
                 f"Only the first {MAX_STATUS_PATHS} changed paths are included"
             )
+        if report.unresolved_graph_fact_count:
+            warnings.append(
+                f"{report.unresolved_graph_fact_count} graph facts remain unresolved"
+            )
+        if report.ambiguous_graph_fact_count:
+            warnings.append(
+                f"{report.ambiguous_graph_fact_count} graph facts are ambiguous"
+            )
 
         return IndexRepositoryResponse(
             repository_path=str(resolved.root),
@@ -229,6 +237,11 @@ class IndexService:
             chunk_count=report.chunk_count,
             embedding_count=report.embedding_count,
             lexical_document_count=report.lexical_document_count,
+            graph_node_count=report.graph_node_count,
+            graph_fact_count=report.graph_fact_count,
+            graph_edge_count=report.graph_edge_count,
+            unresolved_graph_fact_count=report.unresolved_graph_fact_count,
+            ambiguous_graph_fact_count=report.ambiguous_graph_fact_count,
             added_file_count=report.added_file_count,
             changed_file_count=report.changed_file_count,
             deleted_file_count=report.deleted_file_count,
@@ -435,6 +448,11 @@ class IndexService:
             chunk_count=counts["chunks"],
             embedding_count=counts["embeddings"],
             lexical_document_count=counts.get("lexical_documents", 0),
+            graph_node_count=counts.get("graph_nodes", 0),
+            graph_fact_count=counts.get("graph_facts", 0),
+            graph_edge_count=counts.get("graph_edges", 0),
+            unresolved_graph_fact_count=counts.get("graph_unresolved", 0),
+            ambiguous_graph_fact_count=counts.get("graph_ambiguous", 0),
             added_file_count=added_file_count,
             changed_file_count=changed_file_count,
             deleted_file_count=deleted_file_count,
@@ -467,8 +485,19 @@ def _load_counts(
     counts: dict[str, int] = {}
     tables = ["files", "symbols", "chunks", "embeddings"]
     if include_lexical:
-        tables.append("lexical_documents")
+        tables.extend(
+            ["lexical_documents", "graph_nodes", "graph_facts", "graph_edges"]
+        )
     for table in tables:
         raise_if_cancelled(cancellation_callback)
         counts[table] = store.count_rows(table, repository.id)
+    if include_lexical:
+        counts["graph_unresolved"] = store.count_graph_facts_by_status(
+            repository.id,
+            "unresolved",
+        )
+        counts["graph_ambiguous"] = store.count_graph_facts_by_status(
+            repository.id,
+            "ambiguous",
+        )
     return counts

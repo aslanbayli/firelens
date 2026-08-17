@@ -7,7 +7,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -51,6 +51,8 @@ HARD_MAX_SEMANTIC_INDEX_BYTES = 256 * 1024 * 1024
 HARD_MAX_CHUNKS_PER_FILE = 4_096
 HARD_MAX_LEXICAL_CANDIDATES = 5_000
 HARD_MAX_HYBRID_POOL_SIZE = 20
+HARD_MAX_GRAPH_NEIGHBORS = 100
+HARD_MAX_GRAPH_EXPANDED_NODES = 200
 
 
 class Settings(BaseSettings):
@@ -149,6 +151,40 @@ class Settings(BaseSettings):
         min_length=1,
         max_length=64,
     )
+    graph_seed_mode: Literal["hybrid_rrf", "lexical", "semantic"] = "hybrid_rrf"
+    graph_seed_count: int = Field(default=5, ge=1, le=HARD_MAX_HYBRID_POOL_SIZE)
+    graph_max_hops: int = Field(default=1, ge=1, le=2)
+    graph_max_neighbors_per_node: int = Field(
+        default=20,
+        ge=1,
+        le=HARD_MAX_GRAPH_NEIGHBORS,
+    )
+    graph_max_expanded_nodes: int = Field(
+        default=50,
+        ge=1,
+        le=HARD_MAX_GRAPH_EXPANDED_NODES,
+    )
+    graph_allowed_edge_kinds: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "calls",
+            "inherits",
+            "tests",
+            "references",
+            "imports",
+            "depends_on",
+        ]
+    )
+    graph_directions: Annotated[list[Literal["incoming", "outgoing"]], NoDecode] = (
+        Field(default_factory=lambda: ["outgoing", "incoming"])
+    )
+    graph_min_edge_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    graph_hop_decay: float = Field(default=0.7, gt=0.0, le=1.0)
+    graph_calls_weight: float = Field(default=0.9, ge=0.0, le=1.0)
+    graph_imports_weight: float = Field(default=0.6, ge=0.0, le=1.0)
+    graph_inherits_weight: float = Field(default=0.9, ge=0.0, le=1.0)
+    graph_references_weight: float = Field(default=0.65, ge=0.0, le=1.0)
+    graph_depends_on_weight: float = Field(default=0.55, ge=0.0, le=1.0)
+    graph_tests_weight: float = Field(default=1.0, ge=0.0, le=1.0)
     max_fuzzy_candidates: int = Field(
         default=512,
         ge=1,
@@ -225,6 +261,28 @@ class Settings(BaseSettings):
             raise ValueError("allowed_roots must contain at least one path")
 
         return [Path(item).expanduser().resolve() for item in values]
+
+    @field_validator("graph_allowed_edge_kinds", mode="before")
+    @classmethod
+    def parse_graph_edge_kinds(cls, value: Any) -> list[str]:
+        values = value.split(",") if isinstance(value, str) else list(value)
+        normalized = [str(item).strip() for item in values if str(item).strip()]
+        if not normalized:
+            raise ValueError("graph_allowed_edge_kinds must not be empty")
+        if any(not item.replace("-", "_").isidentifier() for item in normalized):
+            raise ValueError("graph edge kinds must be identifiers")
+        return list(dict.fromkeys(normalized))
+
+    @field_validator("graph_directions", mode="before")
+    @classmethod
+    def parse_graph_directions(cls, value: Any) -> list[str]:
+        values = value.split(",") if isinstance(value, str) else list(value)
+        normalized = [str(item).strip() for item in values if str(item).strip()]
+        if not normalized or any(
+            item not in {"incoming", "outgoing"} for item in normalized
+        ):
+            raise ValueError("graph_directions must contain incoming or outgoing")
+        return list(dict.fromkeys(normalized))
 
     @model_validator(mode="after")
     def validate_output_limits(self) -> "Settings":

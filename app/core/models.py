@@ -29,6 +29,7 @@ RetrievalKind = Literal[
     "semantic",
     "hybrid_rrf",
     "hybrid_weighted",
+    "graph",
 ]
 RetrievalMode = Literal[
     "exact",
@@ -37,6 +38,7 @@ RetrievalMode = Literal[
     "semantic",
     "hybrid_rrf",
     "hybrid_weighted",
+    "graph",
     "auto",
 ]
 RETRIEVAL_MODE_OPTIONS = (
@@ -47,8 +49,10 @@ RETRIEVAL_MODE_OPTIONS = (
     "semantic",
     "hybrid_rrf",
     "hybrid_weighted",
+    "graph",
 )
 FusionMethod = Literal["rrf", "normalized_weighted"]
+GraphDirection = Literal["incoming", "outgoing"]
 BackendKind = Literal["python", "mojo"]
 BackendPreference = Literal["auto", "python", "mojo"]
 IndexStatus = Literal["missing", "ready", "stale", "indexing"]
@@ -147,9 +151,76 @@ class RetrievalEvidence(BaseModel):
 class RetrievalTiming(BaseModel):
     """Bounded response-level timing for one retrieval component."""
 
-    component: Literal["lexical", "semantic", "fusion"]
+    component: Literal["lexical", "semantic", "fusion", "graph"]
     elapsed_time: float = Field(ge=0.0, allow_inf_nan=False)
     backend: BackendKind
+
+
+class GraphPathEvidence(BaseModel):
+    """Compact explanation for the graph path that added one result."""
+
+    originating_seed_id: uuid.UUID
+    originating_seed_path: Annotated[str, Field(max_length=4_096)]
+    edge_kind: Annotated[str, Field(min_length=1, max_length=64)]
+    direction: GraphDirection
+    hop_count: int = Field(ge=1, le=2)
+    edge_confidence: float = Field(ge=0.0, le=1.0)
+    graph_contribution: float = Field(ge=0.0, le=1.0)
+
+
+class GraphNode(BaseModel):
+    """Persisted language-neutral repository graph node."""
+
+    id: uuid.UUID
+    repository_id: uuid.UUID
+    kind: Annotated[str, Field(min_length=1, max_length=64)]
+    qualified_name: Annotated[str, Field(min_length=1)]
+    name: Annotated[str, Field(min_length=1)]
+    relative_path: Annotated[str, Field(min_length=1, max_length=4_096)] | None = None
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    symbol_id: uuid.UUID | None = None
+    language: str | None = None
+
+
+class GraphFact(BaseModel):
+    """Persisted adapter-emitted fact before deterministic resolution."""
+
+    id: uuid.UUID
+    repository_id: uuid.UUID
+    source_node_id: uuid.UUID
+    kind: Annotated[str, Field(min_length=1, max_length=64)]
+    source_reference: Annotated[str, Field(min_length=1)]
+    target_reference: Annotated[str, Field(min_length=1)]
+    source_scope: Annotated[str, Field(min_length=1)]
+    source_file: Annotated[str, Field(min_length=1, max_length=4_096)]
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    extraction_adapter: Annotated[str, Field(min_length=1, max_length=64)]
+    adapter_version: Annotated[str, Field(min_length=1, max_length=64)]
+    confidence: float = Field(ge=0.0, le=1.0)
+    target_kind: Annotated[str, Field(min_length=1, max_length=64)] = "any"
+    target_qualified_hint: str | None = None
+    hint_resolution_method: Annotated[str, Field(max_length=64)] | None = None
+    evidence_text: Annotated[str, Field(max_length=256)] | None = None
+
+
+class GraphEdge(BaseModel):
+    """One resolved, directed, provenance-bearing repository relationship."""
+
+    id: uuid.UUID
+    repository_id: uuid.UUID
+    source_node_id: uuid.UUID
+    target_node_id: uuid.UUID
+    kind: Annotated[str, Field(min_length=1, max_length=64)]
+    source_file: Annotated[str, Field(min_length=1, max_length=4_096)]
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+    extraction_adapter: Annotated[str, Field(min_length=1, max_length=64)]
+    adapter_version: Annotated[str, Field(min_length=1, max_length=64)]
+    resolution_method: Annotated[str, Field(min_length=1, max_length=64)]
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_text: Annotated[str, Field(max_length=256)] | None = None
 
 
 class SearchRequest(BaseModel):
@@ -217,6 +288,11 @@ class SearchResult(BaseModel):
         default_factory=list,
         max_length=16,
     )
+    # Present only for candidates added through bounded graph traversal.
+    graph_evidence: list[GraphPathEvidence] = Field(
+        default_factory=list,
+        max_length=2,
+    )
 
 
 class SearchResponse(BaseModel):
@@ -239,7 +315,7 @@ class SearchResponse(BaseModel):
     # Candidate-generation and fusion timings, omitted for single-source modes.
     retrieval_timings: list[RetrievalTiming] = Field(
         default_factory=list,
-        max_length=3,
+        max_length=4,
     )
     # Stable name and hash for the effective retrieval calibration settings.
     retrieval_config: Annotated[str, Field(min_length=1, max_length=128)] = "default"
@@ -269,6 +345,11 @@ class IndexRepositoryResponse(BaseModel):
     chunk_count: int = Field(default=0, ge=0)
     embedding_count: int = Field(default=0, ge=0)
     lexical_document_count: int = Field(default=0, ge=0)
+    graph_node_count: int = Field(default=0, ge=0)
+    graph_fact_count: int = Field(default=0, ge=0)
+    graph_edge_count: int = Field(default=0, ge=0)
+    unresolved_graph_fact_count: int = Field(default=0, ge=0)
+    ambiguous_graph_fact_count: int = Field(default=0, ge=0)
     added_file_count: int = Field(default=0, ge=0)
     changed_file_count: int = Field(default=0, ge=0)
     deleted_file_count: int = Field(default=0, ge=0)
@@ -297,6 +378,11 @@ class IndexStatusResponse(BaseModel):
     chunk_count: int = Field(default=0, ge=0)
     embedding_count: int = Field(default=0, ge=0)
     lexical_document_count: int = Field(default=0, ge=0)
+    graph_node_count: int = Field(default=0, ge=0)
+    graph_fact_count: int = Field(default=0, ge=0)
+    graph_edge_count: int = Field(default=0, ge=0)
+    unresolved_graph_fact_count: int = Field(default=0, ge=0)
+    ambiguous_graph_fact_count: int = Field(default=0, ge=0)
     added_file_count: int = Field(default=0, ge=0)
     changed_file_count: int = Field(default=0, ge=0)
     deleted_file_count: int = Field(default=0, ge=0)

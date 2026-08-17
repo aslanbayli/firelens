@@ -1,3 +1,3 @@
 """Persisted index-format compatibility boundary."""
 
-INDEX_FORMAT_VERSION = "2"
+INDEX_FORMAT_VERSION = "3"

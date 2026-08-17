@@ -139,7 +139,8 @@ def show_index_status(runtime: FireLensRuntime, repository_path: str) -> None:
 
     message = (
         f"{status.status}: {status.file_count} files, "
-        f"{status.symbol_count} symbols, {status.chunk_count} chunks"
+        f"{status.symbol_count} symbols, {status.chunk_count} chunks, "
+        f"{status.graph_edge_count} graph edges"
     )
     if status.status == "ready":
         st.success(message)
@@ -186,7 +187,8 @@ def run_index(runtime: FireLensRuntime, repository_path: str) -> None:
     progress_bar.progress(1.0, text="Indexing complete")
     message = (
         f"Indexed {report.file_count} files, {report.symbol_count} symbols, "
-        f"{report.chunk_count} chunks, and {report.embedding_count} embeddings "
+        f"{report.chunk_count} chunks, {report.embedding_count} embeddings, and "
+        f"{report.graph_edge_count} graph edges "
         f"in {report.elapsed_time:.1f} seconds."
     )
     if report.status == "ready":
@@ -246,6 +248,15 @@ def render_response(response) -> None:
                     for evidence in component_evidence
                 )
                 st.caption(f"Fusion: {result.fusion_method} · {details}")
+            if result.graph_evidence:
+                graph = result.graph_evidence[0]
+                st.caption(
+                    "Graph: "
+                    f"{graph.direction} {graph.edge_kind} from "
+                    f"{graph.originating_seed_path} · hop {graph.hop_count} · "
+                    f"confidence {graph.edge_confidence:.2f} · "
+                    f"contribution {graph.graph_contribution:.2f}"
+                )
             if result.snippet_truncated:
                 st.caption("Snippet truncated to the configured output limit.")
             st.code(result.snippet, language=_display_language(result.language))

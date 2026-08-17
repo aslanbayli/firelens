@@ -26,6 +26,7 @@ from app.indexing.embedder import CodeRankEmbedder, Embedder
 from app.indexing.service import INDEX_FORMAT_VERSION
 from app.search.exact import exact_search
 from app.search.fuzzy import fuzzy_search
+from app.search.graph import GraphSearchConfig, graph_search
 from app.search.hybrid import (
     NormalizedWeightedFusionConfig,
     ReciprocalRankFusionConfig,
@@ -100,6 +101,7 @@ class SearchService:
         self._semantic_inflight_vector_bytes = 0
         self._semantic_inflight_candidate_count = 0
         self._lexical_config = LexicalSearchConfig.from_settings(settings)
+        self._graph_config = GraphSearchConfig.from_settings(settings)
         self._retrieval_config = _retrieval_config_identity(settings)
 
     def search(
@@ -234,8 +236,16 @@ class SearchService:
                 resolved.database_path,
                 cancellation_callback,
             )
-        else:
+        elif request.request_mode in {"hybrid_rrf", "hybrid_weighted"}:
             response = self._hybrid_search(
+                store,
+                repository.id,
+                request,
+                resolved.database_path,
+                cancellation_callback,
+            )
+        else:
+            response = self._graph_search(
                 store,
                 repository.id,
                 request,
@@ -251,7 +261,7 @@ class SearchService:
                 "retrieval_config": (
                     response.retrieval_config
                     if request.request_mode
-                    in {"hybrid_rrf", "hybrid_weighted"}
+                    in {"hybrid_rrf", "hybrid_weighted", "graph"}
                     else self._retrieval_config
                 ),
             }
@@ -493,6 +503,81 @@ class SearchService:
                 fusion_config.name,
                 fusion_config.model_dump(mode="json"),
             ),
+        )
+
+    def _graph_search(
+        self,
+        store: SQLiteIndexStore,
+        repository_id: uuid.UUID,
+        request: SearchRequest,
+        database_path: Path,
+        cancellation_callback: CancellationCallback | None,
+    ) -> SearchResponse:
+        """Generate configured seeds and expand them through bounded adjacency."""
+
+        seed_request = request.model_copy(
+            update={
+                "request_mode": self._graph_config.seed_mode,
+                "top_k": self._graph_config.seed_count,
+            }
+        )
+        if self._graph_config.seed_mode == "hybrid_rrf":
+            seed_response = self._hybrid_search(
+                store,
+                repository_id,
+                seed_request,
+                database_path,
+                cancellation_callback,
+            )
+        elif self._graph_config.seed_mode == "semantic":
+            seed_response = self._semantic_search(
+                store,
+                repository_id,
+                seed_request,
+                database_path,
+                cancellation_callback,
+                candidate_pool_size=self._graph_config.seed_count,
+            )
+        else:
+            if request.backend == "mojo":
+                raise BackendUnavailableError(
+                    "Graph retrieval with lexical seeds uses SQLite/Python"
+                )
+            seed_response = lexical_search(
+                store,
+                repository_id,
+                seed_request,
+                self._lexical_config,
+                candidate_pool_size=self._graph_config.seed_count,
+                retrieval_config=self._retrieval_config,
+                cancellation_callback=cancellation_callback,
+            )
+
+        graph_config_values = {
+            "seed_mode": self._graph_config.seed_mode,
+            "seed_count": self._graph_config.seed_count,
+            "max_hops": self._graph_config.max_hops,
+            "maximum_neighbors_per_node": (
+                self._graph_config.maximum_neighbors_per_node
+            ),
+            "maximum_expanded_nodes": self._graph_config.maximum_expanded_nodes,
+            "allowed_edge_kinds": self._graph_config.allowed_edge_kinds,
+            "directions": self._graph_config.directions,
+            "minimum_edge_confidence": self._graph_config.minimum_edge_confidence,
+            "hop_decay": self._graph_config.hop_decay,
+            "edge_weights": self._graph_config.edge_weights,
+        }
+        return graph_search(
+            store,
+            repository_id,
+            request,
+            seed_response,
+            self._graph_config,
+            retrieval_config=_named_retrieval_config_identity(
+                "graph",
+                graph_config_values,
+            ),
+            cancellation_callback=cancellation_callback,
         )
 
     def _load_semantic_index(
@@ -833,6 +918,25 @@ def _retrieval_config_identity(settings: Settings) -> str:
                 settings.hybrid_weighted_missing_source_value
             ),
             "tie_breaking_version": settings.hybrid_tie_breaking_version,
+        },
+        "graph": {
+            "seed_mode": settings.graph_seed_mode,
+            "seed_count": settings.graph_seed_count,
+            "max_hops": settings.graph_max_hops,
+            "maximum_neighbors_per_node": settings.graph_max_neighbors_per_node,
+            "maximum_expanded_nodes": settings.graph_max_expanded_nodes,
+            "allowed_edge_kinds": settings.graph_allowed_edge_kinds,
+            "directions": settings.graph_directions,
+            "minimum_edge_confidence": settings.graph_min_edge_confidence,
+            "hop_decay": settings.graph_hop_decay,
+            "edge_weights": {
+                "calls": settings.graph_calls_weight,
+                "imports": settings.graph_imports_weight,
+                "inherits": settings.graph_inherits_weight,
+                "references": settings.graph_references_weight,
+                "depends_on": settings.graph_depends_on_weight,
+                "tests": settings.graph_tests_weight,
+            },
         },
         "lexical": {
             "exact_qualified_bonus": settings.lexical_exact_qualified_bonus,
