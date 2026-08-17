@@ -217,6 +217,118 @@ class RetrievalCoreIntegrationTests(unittest.TestCase):
             )
         )
 
+    def test_lexical_search_hides_comments_unless_requested(self) -> None:
+        self.runtime.index_repository(self.repository)
+
+        ordinary = self.runtime.search_code(
+            self.repository,
+            "credentials",
+            mode="lexical",
+            top_k=20,
+        )
+        comments = self.runtime.search_code(
+            self.repository,
+            "credentials comments",
+            mode="lexical",
+            top_k=20,
+        )
+
+        self.assertNotIn(
+            "symbol_comment",
+            {result.semantic_unit_kind for result in ordinary.ranked_results},
+        )
+        self.assertTrue(
+            any(
+                result.result_type == "symbol"
+                and "def authenticateUser" in result.snippet
+                and "return bool(user)" in result.snippet
+                for result in comments.ranked_results
+            )
+        )
+
+    def test_lexical_search_hides_imports_unless_requested(self) -> None:
+        self.runtime.index_repository(self.repository)
+
+        ordinary = self.runtime.search_code(
+            self.repository,
+            "secrets",
+            mode="lexical",
+            top_k=20,
+        )
+        imports = self.runtime.search_code(
+            self.repository,
+            "secrets import",
+            mode="lexical",
+            top_k=20,
+        )
+
+        self.assertNotIn(
+            "imports",
+            {result.semantic_unit_kind for result in ordinary.ranked_results},
+        )
+        self.assertIn(
+            "imports",
+            {result.semantic_unit_kind for result in imports.ranked_results},
+        )
+
+    def test_filename_terms_do_not_surface_import_or_comment_fragments(self) -> None:
+        function_source = (
+            "def run_fuzzy_search(query):\n"
+            "    score = 0\n"
+            + "".join(
+                f"    score += {index}\n"
+                for index in range(250)
+            )
+            + "    return score, query\n"
+        )
+        source = (
+            "# Fuzzy search implementation notes.\n"
+            "from app.search.fuzzy import fuzzy_search\n\n"
+            "FUZZY_SEARCH_LIMIT = 512\n\n"
+            + function_source
+        )
+        self.assertGreater(len(function_source), 2_000)
+        (self.repository / "fuzzy_search.py").write_text(source, encoding="utf-8")
+        self.runtime.index_repository(self.repository)
+
+        response = self.runtime.search_code(
+            self.repository,
+            "fuzzy search",
+            mode="lexical",
+            top_k=20,
+        )
+
+        symbol_result = next(
+            result
+            for result in response.ranked_results
+            if result.result_type == "symbol"
+            and result.symbol_name == "run_fuzzy_search"
+        )
+        file_result = next(
+            result
+            for result in response.ranked_results
+            if result.result_type == "file"
+            and result.file_path == "fuzzy_search.py"
+        )
+
+        self.assertEqual(symbol_result.snippet, function_source)
+        self.assertEqual(file_result.snippet, source)
+        self.assertFalse(symbol_result.snippet_truncated)
+        self.assertFalse(file_result.snippet_truncated)
+        self.assertEqual(
+            sum(
+                result.symbol_name == "run_fuzzy_search"
+                for result in response.ranked_results
+            ),
+            1,
+        )
+        self.assertTrue(
+            all(
+                result.result_type in {"symbol", "file"}
+                for result in response.ranked_results
+            )
+        )
+
     def test_path_filter_applies_to_every_lexical_channel_and_deletion(self) -> None:
         self.runtime.index_repository(self.repository)
 

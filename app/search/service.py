@@ -37,6 +37,7 @@ from app.search.hybrid import (
 from app.search.lexical import LexicalSearchConfig, lexical_search
 from app.search.router import classify_non_exact_query
 from app.search.semantic import (
+    SEMANTIC_RANKING_VERSION,
     SemanticSearchIndex,
     load_semantic_search_index,
     semantic_search,
@@ -866,32 +867,32 @@ class SearchService:
     ) -> SearchResponse:
         remaining_characters = min(
             self.settings.max_total_snippet_chars,
-            12_000,
+            64_000,
         )
         bounded_results: list[SearchResult] = []
-        any_truncated = False
+        omitted_result_count = 0
 
         for result in response.ranked_results:
             raise_if_cancelled(cancellation_callback)
-            allowed_characters = min(per_result_limit, remaining_characters)
-            snippet = result.snippet[:allowed_characters]
-            was_truncated = (
-                result.snippet_truncated or len(snippet) < len(result.snippet)
-            )
-            any_truncated = any_truncated or was_truncated
-            bounded_results.append(
-                result.model_copy(
-                    update={
-                        "snippet": snippet,
-                        "snippet_truncated": was_truncated,
-                    }
-                )
-            )
-            remaining_characters -= len(snippet)
+            source_is_complete = not result.snippet_truncated
+            source_fits_result_limit = len(result.snippet) <= per_result_limit
+            source_fits_total_limit = len(result.snippet) <= remaining_characters
+            if not (
+                source_is_complete
+                and source_fits_result_limit
+                and source_fits_total_limit
+            ):
+                omitted_result_count += 1
+                continue
+            bounded_results.append(result)
+            remaining_characters -= len(result.snippet)
 
         warnings = list(response.warnings)
-        if any_truncated:
-            warnings.append("One or more snippets were truncated to output limits")
+        if omitted_result_count:
+            warnings.append(
+                f"Omitted {omitted_result_count} result(s) because complete source "
+                "did not fit the configured output limits"
+            )
 
         return response.model_copy(
             update={"ranked_results": bounded_results, "warnings": warnings}
@@ -905,7 +906,10 @@ def _retrieval_config_identity(settings: Settings) -> str:
         "fuzzy_threshold": settings.fuzzy_threshold,
         "max_fuzzy_candidates": settings.max_fuzzy_candidates,
         "max_semantic_candidates": settings.max_semantic_candidates,
-        "semantic_score_floor": settings.semantic_score_floor,
+        "semantic": {
+            "score_floor": settings.semantic_score_floor,
+            "ranking_version": SEMANTIC_RANKING_VERSION,
+        },
         "hybrid": {
             "lexical_pool_size": settings.hybrid_lexical_pool_size,
             "semantic_pool_size": settings.hybrid_semantic_pool_size,

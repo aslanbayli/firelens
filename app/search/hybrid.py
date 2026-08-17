@@ -111,7 +111,7 @@ class RetrievalCandidate:
     file_path: str
     start_line: int
     end_line: int
-    result_type: Literal["symbol", "chunk"]
+    result_type: Literal["symbol", "chunk", "file"]
     semantic_unit_kind: str | None
     language: str
     symbol_id: uuid.UUID | None

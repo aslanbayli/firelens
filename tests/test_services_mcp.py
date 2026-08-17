@@ -272,7 +272,7 @@ class ServiceRuntimeTests(unittest.TestCase):
         self.assertEqual(factory_call_count, 1)
         self.assertEqual(embedder.query_call_count, 1)
 
-    def test_search_bounds_each_snippet_and_the_aggregate_output(self) -> None:
+    def test_search_omits_source_units_that_do_not_fit_output_limits(self) -> None:
         for file_name in ("a.py", "b.py", "c.py"):
             self._write_source(
                 file_name,
@@ -306,17 +306,10 @@ class ServiceRuntimeTests(unittest.TestCase):
             max_snippet_chars=30,
         )
 
-        snippet_lengths = [
-            len(result.snippet) for result in response.ranked_results
-        ]
-        self.assertEqual(snippet_lengths, [30, 20, 0])
-        self.assertLessEqual(max(snippet_lengths), 30)
-        self.assertEqual(sum(snippet_lengths), 50)
-        self.assertTrue(
-            all(result.snippet_truncated for result in response.ranked_results)
-        )
+        self.assertFalse(response.ranked_results)
         self.assertIn(
-            "One or more snippets were truncated to output limits",
+            "Omitted 3 result(s) because complete source did not fit the "
+            "configured output limits",
             response.warnings,
         )
 

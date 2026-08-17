@@ -90,7 +90,7 @@ class FireLensRuntime:
         top_k: int = 5,
         path: str | None = None,
         backend: BackendPreference = "auto",
-        max_snippet_chars: int = 2_000,
+        max_snippet_chars: int = 12_000,
         cancellation_callback: CancellationCallback | None = None,
     ) -> SearchResponse:
         request = SearchRequest(

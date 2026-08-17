@@ -58,7 +58,7 @@ BackendPreference = Literal["auto", "python", "mojo"]
 IndexStatus = Literal["missing", "ready", "stale", "indexing"]
 
 TopK = Annotated[int, Field(ge=1, le=20)]
-SnippetCharacterLimit = Annotated[int, Field(ge=1, le=4_000)]
+SnippetCharacterLimit = Annotated[int, Field(ge=1, le=32_000)]
 QueryText = Annotated[str, Field(min_length=1, max_length=2_000)]
 BoundedPathSamples = Annotated[list[str], Field(max_length=20)]
 BoundedIndexingErrors = Annotated[
@@ -237,7 +237,7 @@ class SearchRequest(BaseModel):
     # Compute implementation requested for supported hot loops.
     backend: BackendPreference = "auto"
     # Maximum source characters included in each returned result.
-    max_snippet_chars: SnippetCharacterLimit = 2_000
+    max_snippet_chars: SnippetCharacterLimit = 12_000
 
     @field_validator("query")
     @classmethod
@@ -250,27 +250,27 @@ class SearchRequest(BaseModel):
 
 
 class SearchResult(BaseModel):
-    """One ranked symbol or chunk returned by retrieval."""
+    """One ranked source entity returned by retrieval."""
 
-    # Identity of the matched Symbol or Chunk record.
+    # Stable identity of the returned symbol, file, or legacy chunk record.
     id: uuid.UUID
     # Indicates which record type should be loaded or interpreted.
-    result_type: Literal["symbol", "chunk"]
+    result_type: Literal["symbol", "chunk", "file"]
     # Repository-relative source file containing the match.
     file_path: Annotated[str, Field(max_length=4_096)]
     # Inclusive one-based source range displayed to the caller.
     start_line: int
     end_line: int
-    # Available for symbol-owned results; absent for module-level chunks.
+    # Available for symbol-owned results; absent for file-level results.
     symbol_name: Annotated[str, Field(max_length=4_096)] | None = None
     # Stable owning symbol identity used to collapse symbol/chunk overlap.
     symbol_id: uuid.UUID | None = None
     # Source language used by renderers and coding agents.
     language: str = "python"
-    # Present for semantic-unit results and absent for standalone symbols.
+    # Records the internal semantic evidence kind when one is available.
     semantic_unit_kind: SemanticUnitKind | None = None
     # Bounded source text included with the result.
-    snippet: Annotated[str, Field(max_length=4_000)]
+    snippet: Annotated[str, Field(max_length=32_000)]
     # True when the source text was shortened to satisfy an output limit.
     snippet_truncated: bool = False
     # Mode-specific relevance normalized into a comparable output range.

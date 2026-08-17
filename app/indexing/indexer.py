@@ -9,7 +9,7 @@ import hashlib
 import os
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
@@ -663,6 +663,14 @@ def _index_to_sqlite_in_place(
             )
             continue
 
+        if file_index.source_text is None:
+            raise ValueError("Indexed file is missing its source snapshot")
+        file_record = replace(
+            file_record,
+            source_text=file_index.source_text,
+            line_count=file_index.line_count,
+        )
+
         _emit_progress(
             progress_callback,
             "parse",
@@ -899,6 +907,8 @@ class _FileIndex:
     lexical_documents: list[LexicalDocument]
     graph_nodes: list[GraphNode]
     graph_facts: list[GraphFact]
+    source_text: str | None = None
+    line_count: int = 1
 
 
 def _index_single_file(
@@ -1055,6 +1065,8 @@ def _index_single_file(
         lexical_documents=lexical_documents,
         graph_nodes=graph_nodes,
         graph_facts=graph_facts,
+        source_text=source,
+        line_count=max(1, len(source.splitlines())),
     )
 
 

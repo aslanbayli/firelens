@@ -37,7 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "python", "mojo"),
         default="auto",
     )
-    search_parser.add_argument("--max-snippet-chars", type=int, default=2_000)
+    search_parser.add_argument(
+        "--max-snippet-chars",
+        type=int,
+        default=12_000,
+        help="Maximum size of one complete source result (default: 12000)",
+    )
 
     return parser
 

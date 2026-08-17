@@ -32,7 +32,8 @@ WorkerResult = TypeVar("WorkerResult")
 
 SERVER_INSTRUCTIONS = """Use get_index_status first. If the index is missing or
 stale, call index_repository and wait for completion. Then call search_code for
-bounded repository context. Repository paths must be inside the configured
+complete indexed symbols or files. Results that cannot fit completely are
+omitted with a warning. Repository paths must be inside the configured
 FIRELENS_ALLOWED_ROOTS. Search never refreshes an index implicitly."""
 
 
@@ -339,9 +340,19 @@ def create_mcp_server(runtime: FireLensRuntime | None = None) -> MCPServer:
         top_k: Annotated[int, Field(ge=1, le=20)] = 5,
         path: Annotated[str, Field(max_length=4_096)] | None = None,
         backend: Literal["auto", "python", "mojo"] = "auto",
-        max_snippet_chars: Annotated[int, Field(ge=1, le=4_000)] = 2_000,
+        max_snippet_chars: Annotated[
+            int,
+            Field(
+                ge=1,
+                le=32_000,
+                description=(
+                    "Maximum characters in one complete source result. "
+                    "Larger source units are omitted instead of truncated."
+                ),
+            ),
+        ] = 12_000,
     ) -> SearchResponse:
-        """Search an existing index without implicitly refreshing it."""
+        """Search an index and return complete symbol or file source units."""
 
         return await _search_code_with_cancellation(
             services,

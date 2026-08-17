@@ -16,6 +16,7 @@ from app.core.models import (
 from app.indexing.adapters import DEFAULT_ADAPTER_REGISTRY
 from app.search.fuzzy import fuzzy_search
 from app.search.limits import bounded_symbol_name
+from app.search.relevance import is_result_kind_requested
 from app.storage.database import (
     SQLiteIndexStore,
     SearchCandidateLimitError,
@@ -142,7 +143,7 @@ def lexical_search(
     if not query:
         return _empty_response(request, retrieval_config)
 
-    merged: dict[tuple[str, uuid.UUID], _MergedResult] = {}
+    merged: dict[tuple[str, str], _MergedResult] = {}
     warnings: list[str] = []
 
     exact_candidates = store.exact_lexical_candidates(
@@ -164,6 +165,7 @@ def lexical_search(
                 "exact_qualified",
                 qualified_rank,
                 config.exact_qualified_bonus,
+                query,
                 request.max_snippet_chars,
                 config.maximum_documents_ranked,
             )
@@ -175,6 +177,7 @@ def lexical_search(
                 "exact_short",
                 short_rank,
                 config.exact_short_bonus,
+                query,
                 request.max_snippet_chars,
                 config.maximum_documents_ranked,
             )
@@ -198,6 +201,7 @@ def lexical_search(
                 "path",
                 rank,
                 config.path_bonus,
+                query,
                 request.max_snippet_chars,
                 config.maximum_documents_ranked,
             )
@@ -221,6 +225,7 @@ def lexical_search(
             "identifier",
             rank,
             config.identifier_bonus,
+            query,
             request.max_snippet_chars,
             config.maximum_documents_ranked,
         )
@@ -247,6 +252,7 @@ def lexical_search(
             "bm25",
             rank,
             config.bm25_bonus,
+            query,
             request.max_snippet_chars,
             config.maximum_documents_ranked,
         )
@@ -282,6 +288,12 @@ def lexical_search(
                 config.maximum_documents_ranked,
             )
 
+    _expand_contextual_results(
+        store,
+        repository_id,
+        merged,
+        request.max_snippet_chars,
+    )
     ranked = [_finalize_result(item) for item in merged.values()]
     ranked.sort(key=_result_sort_key)
     return SearchResponse(
@@ -298,15 +310,26 @@ def lexical_search(
 
 
 def _add_candidate(
-    merged: dict[tuple[str, uuid.UUID], _MergedResult],
+    merged: dict[tuple[str, str], _MergedResult],
     candidate: StoredLexicalCandidate,
     channel: str,
     rank: int,
     weight: float,
+    query: str,
     max_snippet_chars: int,
     maximum_documents: int,
 ) -> None:
+    if (
+        candidate.symbol_id is None
+        and not is_result_kind_requested(query, candidate.semantic_unit_kind)
+    ):
+        return
     snippet = candidate.snippet[:max_snippet_chars]
+    symbol_id = (
+        candidate.symbol_id
+        if candidate.symbol_id is not None
+        else candidate.record_id if candidate.result_type == "symbol" else None
+    )
     result = SearchResult(
         id=candidate.record_id,
         result_type=candidate.result_type,
@@ -314,6 +337,7 @@ def _add_candidate(
         start_line=candidate.start_line,
         end_line=candidate.end_line,
         symbol_name=bounded_symbol_name(candidate.qualified_name),
+        symbol_id=symbol_id,
         language=candidate.language,
         semantic_unit_kind=candidate.semantic_unit_kind,
         snippet=snippet,
@@ -326,7 +350,7 @@ def _add_candidate(
 
 
 def _add_search_result(
-    merged: dict[tuple[str, uuid.UUID], _MergedResult],
+    merged: dict[tuple[str, str], _MergedResult],
     result: SearchResult,
     channel: str,
     rank: int,
@@ -353,7 +377,7 @@ def _add_search_result(
 
 
 def _merge_result(
-    merged: dict[tuple[str, uuid.UUID], _MergedResult],
+    merged: dict[tuple[str, str], _MergedResult],
     result: SearchResult,
     channel: str,
     rank: int,
@@ -361,7 +385,7 @@ def _merge_result(
     channel_quality: float,
     maximum_documents: int,
 ) -> None:
-    key = (result.result_type, result.id)
+    key = _result_identity(result)
     existing = merged.get(key)
     if existing is None:
         if len(merged) >= maximum_documents:
@@ -370,12 +394,91 @@ def _merge_result(
         merged[key] = existing
     rank_score = 1.0 / rank
     evidence_score = max(0.0, min(1.0, rank_score * channel_quality))
+    current_evidence = existing.evidence.get(channel)
+    if current_evidence is not None and current_evidence.score >= evidence_score:
+        return
     existing.evidence[channel] = RetrievalEvidence(
         channel=channel,
         score=evidence_score,
         rank=rank,
     )
     existing.weighted_scores[channel] = weight * evidence_score
+
+
+def _result_identity(result: SearchResult) -> tuple[str, str]:
+    if result.symbol_id is not None:
+        return "symbol", str(result.symbol_id)
+    if result.result_type == "symbol":
+        return "symbol", str(result.id)
+    return "file", result.file_path
+
+
+def _expand_contextual_results(
+    store: SQLiteIndexStore,
+    repository_id: uuid.UUID,
+    merged: dict[tuple[str, str], _MergedResult],
+    max_snippet_chars: int,
+) -> None:
+    """Replace matched chunks with their complete symbol or file context."""
+
+    symbol_ids = [
+        uuid.UUID(identity)
+        for kind, identity in merged
+        if kind == "symbol"
+    ]
+    file_paths = [identity for kind, identity in merged if kind == "file"]
+    symbols_by_id = store.load_symbols_by_ids(
+        symbol_ids,
+        max_snippet_chars=max_snippet_chars,
+    )
+    files_by_path = store.load_file_sources_by_paths(
+        repository_id,
+        file_paths,
+        max_snippet_chars=max_snippet_chars,
+    )
+
+    for (kind, identity), item in merged.items():
+        if kind == "symbol":
+            symbol_id = uuid.UUID(identity)
+            symbol = symbols_by_id.get(symbol_id)
+            if symbol is None:
+                raise ValueError("Ranked lexical symbol was not found")
+            snippet = symbol.source_snippet[:max_snippet_chars]
+            item.result = item.result.model_copy(
+                update={
+                    "id": symbol.id,
+                    "result_type": "symbol",
+                    "file_path": symbol.relative_path,
+                    "start_line": symbol.start_line,
+                    "end_line": symbol.end_line,
+                    "symbol_name": bounded_symbol_name(symbol.qualified_name),
+                    "symbol_id": symbol.id,
+                    "language": symbol.language,
+                    "semantic_unit_kind": None,
+                    "snippet": snippet,
+                    "snippet_truncated": len(snippet) < len(symbol.source_snippet),
+                }
+            )
+            continue
+
+        source_file = files_by_path.get(identity)
+        if source_file is None:
+            raise ValueError("Ranked lexical file was not found")
+        snippet = source_file.source_text[:max_snippet_chars]
+        item.result = item.result.model_copy(
+            update={
+                "id": uuid.uuid5(repository_id, f"file:{source_file.relative_path}"),
+                "result_type": "file",
+                "file_path": source_file.relative_path,
+                "start_line": 1,
+                "end_line": source_file.line_count,
+                "symbol_name": None,
+                "symbol_id": None,
+                "language": source_file.language,
+                "snippet": snippet,
+                "snippet_truncated": len(snippet) < len(source_file.source_text),
+            }
+        )
 
 
 def _finalize_result(merged: _MergedResult) -> SearchResult:
