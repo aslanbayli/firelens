@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.core.config import settings
+from app.core.models import RETRIEVAL_MODE_OPTIONS
 from app.core.runtime import FireLensRuntime, build_runtime
 from app.indexing.indexer import IndexingProgress
 from app.indexing.service import AvailableIndex
@@ -57,7 +58,7 @@ def main() -> None:
 
     mode = st.segmented_control(
         "Mode",
-        options=["auto", "exact", "fuzzy", "lexical", "semantic"],
+        options=RETRIEVAL_MODE_OPTIONS,
         default="auto",
     )
     query = st.text_input("Search")
@@ -232,6 +233,19 @@ def render_response(response) -> None:
             f"score {result.score:.2f}"
         )
         with st.expander(label):
+            if result.fusion_method is not None:
+                component_evidence = [
+                    evidence
+                    for evidence in result.retrieval_evidence
+                    if evidence.channel in {"lexical", "semantic"}
+                ]
+                details = " · ".join(
+                    f"{evidence.channel} rank {evidence.rank}, "
+                    f"normalized {evidence.score:.2f}, "
+                    f"backend {evidence.backend}"
+                    for evidence in component_evidence
+                )
+                st.caption(f"Fusion: {result.fusion_method} · {details}")
             if result.snippet_truncated:
                 st.caption("Snippet truncated to the configured output limit.")
             st.code(result.snippet, language=_display_language(result.language))

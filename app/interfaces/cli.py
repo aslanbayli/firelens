@@ -4,6 +4,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
+from app.core.models import RETRIEVAL_MODE_OPTIONS
 from app.core.runtime import FireLensRuntime, build_runtime
 from app.indexing.indexer import IndexingProgress
 
@@ -26,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("query")
     search_parser.add_argument(
         "--mode",
-        choices=("auto", "exact", "fuzzy", "lexical", "semantic"),
+        choices=RETRIEVAL_MODE_OPTIONS,
         default="auto",
     )
     search_parser.add_argument("--top-k", type=int, default=5)

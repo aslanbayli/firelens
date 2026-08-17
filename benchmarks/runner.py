@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -61,12 +62,19 @@ class BenchmarkConfig:
     semantic_dimension: int = 128
     fuzzy_sizes: tuple[int, ...] = (32, 128)
     exact_sizes: tuple[int, ...] = (1_000, 5_000)
+    fusion_sizes: tuple[int, ...] = (40,)
     top_k: int = 10
     minimum_fuzzy_score: float = 0.55
     warmups: int = 2
     runs: int = 5
     seed: int = 20260816
-    operations: tuple[str, ...] = ("semantic", "fuzzy", "exact")
+    operations: tuple[str, ...] = (
+        "semantic",
+        "fuzzy",
+        "exact",
+        "hybrid_rrf",
+        "hybrid_weighted",
+    )
 
     @classmethod
     def full(cls) -> BenchmarkConfig:
@@ -77,6 +85,7 @@ class BenchmarkConfig:
             semantic_dimension=768,
             fuzzy_sizes=(128, 512),
             exact_sizes=(10_000, 50_000, 100_000),
+            fusion_sizes=(40,),
             warmups=5,
             runs=30,
         )
@@ -90,6 +99,8 @@ class BenchmarkConfig:
             raise ValueError("fuzzy sizes must be greater than 0")
         if any(size < 1 for size in self.exact_sizes):
             raise ValueError("exact sizes must be greater than 0")
+        if any(size < 2 or size > 40 for size in self.fusion_sizes):
+            raise ValueError("fusion sizes must be between 2 and 40")
         if self.semantic_dimension < 1:
             raise ValueError("semantic_dimension must be greater than 0")
         if self.top_k < 1:
@@ -100,9 +111,15 @@ class BenchmarkConfig:
             raise ValueError("warmups must not be negative")
         if self.runs < 1:
             raise ValueError("runs must be greater than 0")
-        allowed_operations = {"semantic", "fuzzy", "exact"}
+        allowed_operations = {
+            "semantic",
+            "fuzzy",
+            "exact",
+            "hybrid_rrf",
+            "hybrid_weighted",
+        }
         if not self.operations or not set(self.operations) <= allowed_operations:
-            raise ValueError("operations must contain semantic, fuzzy, or exact")
+            raise ValueError("operations contain an unsupported benchmark")
 
 
 @dataclass(frozen=True)
@@ -162,6 +179,17 @@ def run_benchmarks(
                     reference_backend,
                     comparison_backend,
                     comparison_skip_reason,
+                )
+            )
+    for operation in ("hybrid_rrf", "hybrid_weighted"):
+        if operation not in selected_config.operations:
+            continue
+        for candidate_count in selected_config.fusion_sizes:
+            cases.append(
+                _run_fusion_case(
+                    selected_config,
+                    candidate_count,
+                    operation,
                 )
             )
 
@@ -291,6 +319,120 @@ def _run_exact_case(
         warmups=config.warmups,
         runs=config.runs,
     )
+
+
+def _run_fusion_case(
+    config: BenchmarkConfig,
+    candidate_count: int,
+    operation: str,
+) -> dict[str, Any]:
+    """Measure bounded Python fusion without implying a Mojo comparison."""
+
+    from app.core.models import SearchResult
+    from app.search.hybrid import (
+        NormalizedWeightedFusionConfig,
+        ReciprocalRankFusionConfig,
+        RetrievalCandidate,
+        normalized_weighted_fusion,
+        reciprocal_rank_fusion,
+    )
+
+    repository_id = uuid.UUID(int=1)
+    lexical_count = candidate_count // 2
+    semantic_count = candidate_count - lexical_count
+
+    def make_candidate(source: str, rank: int) -> RetrievalCandidate:
+        record_id = uuid.UUID(int=rank)
+        result = SearchResult(
+            id=record_id,
+            result_type="chunk",
+            file_path=f"src/module_{rank:03d}.py",
+            start_line=rank,
+            end_line=rank + 2,
+            symbol_name=f"module_{rank}.value",
+            snippet="def value():\n    return 1",
+            score=1.0 - (rank - 1) / max(1, candidate_count),
+            mode=source,
+            backend="python",
+        )
+        return RetrievalCandidate(
+            repository_id=repository_id,
+            stable_record_id=record_id,
+            file_path=result.file_path,
+            start_line=result.start_line,
+            end_line=result.end_line,
+            result_type="chunk",
+            semantic_unit_kind="symbol",
+            language="python",
+            symbol_id=None,
+            qualified_name=result.symbol_name,
+            retriever=source,
+            source_rank=rank,
+            raw_score=result.score,
+            result=result,
+        )
+
+    candidates = [
+        *(make_candidate("lexical", rank) for rank in range(1, lexical_count + 1)),
+        *(make_candidate("semantic", rank) for rank in range(1, semantic_count + 1)),
+    ]
+    if operation == "hybrid_rrf":
+        fusion_config = ReciprocalRankFusionConfig(
+            lexical_pool_size=lexical_count,
+            semantic_pool_size=semantic_count,
+            rrf_k=60,
+            lexical_weight=1,
+            semantic_weight=1,
+            final_top_k=min(config.top_k, 20),
+            tie_breaking_version="source-location-v1",
+        )
+        benchmark_operation = lambda: reciprocal_rank_fusion(
+            candidates,
+            fusion_config,
+        )
+    else:
+        fusion_config = NormalizedWeightedFusionConfig(
+            lexical_pool_size=lexical_count,
+            semantic_pool_size=semantic_count,
+            lexical_weight=1,
+            semantic_weight=1,
+            final_top_k=min(config.top_k, 20),
+            tie_breaking_version="source-location-v1",
+        )
+        benchmark_operation = lambda: normalized_weighted_fusion(
+            candidates,
+            fusion_config,
+        )
+
+    timing, output = measure_operation(
+        benchmark_operation,
+        warmups=config.warmups,
+        runs=config.runs,
+    )
+    return {
+        "operation": operation,
+        "candidate_count": candidate_count,
+        "parameters": {
+            "lexical_candidate_count": lexical_count,
+            "semantic_candidate_count": semantic_count,
+            "final_top_k": min(config.top_k, 20),
+            "interop_bytes": 0,
+            "interop_boundary": "none; pure Python fusion",
+            "result_count": len(output),
+        },
+        "reference": {
+            "backend": "python",
+            "timing": asdict(timing),
+            "throughput": _throughput(timing, candidate_count),
+        },
+        "comparison": None,
+        "parity": {
+            "status": "not_run",
+            "passed": None,
+            "details": "No Mojo fusion kernel is justified by current profiling",
+        },
+        "speedup": None,
+    }
 
 
 def _run_case(
@@ -720,6 +862,7 @@ def _config_dict(config: BenchmarkConfig) -> dict[str, Any]:
         "semantic_dimension": config.semantic_dimension,
         "fuzzy_sizes": list(config.fuzzy_sizes),
         "exact_sizes": list(config.exact_sizes),
+        "fusion_sizes": list(config.fusion_sizes),
         "top_k": config.top_k,
         "minimum_fuzzy_score": config.minimum_fuzzy_score,
         "warmups": config.warmups,
@@ -762,10 +905,16 @@ def _parse_sizes(value: str) -> tuple[int, ...]:
 
 def _parse_operations(value: str) -> tuple[str, ...]:
     operations = tuple(part.strip() for part in value.split(",") if part.strip())
-    allowed_operations = {"semantic", "fuzzy", "exact"}
+    allowed_operations = {
+        "semantic",
+        "fuzzy",
+        "exact",
+        "hybrid_rrf",
+        "hybrid_weighted",
+    }
     if not operations or not set(operations) <= allowed_operations:
         raise argparse.ArgumentTypeError(
-            "operations must contain semantic, fuzzy, or exact"
+            "operations contain an unsupported benchmark"
         )
     return operations
 
@@ -779,6 +928,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-dimension", type=int)
     parser.add_argument("--fuzzy-sizes", type=_parse_sizes)
     parser.add_argument("--exact-sizes", type=_parse_sizes)
+    parser.add_argument("--fusion-sizes", type=_parse_sizes)
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--warmups", type=int)
     parser.add_argument("--runs", type=int)
@@ -806,6 +956,7 @@ def _config_from_arguments(arguments: argparse.Namespace) -> BenchmarkConfig:
         "semantic_dimension": arguments.semantic_dimension,
         "fuzzy_sizes": arguments.fuzzy_sizes,
         "exact_sizes": arguments.exact_sizes,
+        "fusion_sizes": arguments.fusion_sizes,
         "top_k": arguments.top_k,
         "warmups": arguments.warmups,
         "runs": arguments.runs,

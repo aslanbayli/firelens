@@ -125,6 +125,7 @@ def lexical_search(
     request: SearchRequest,
     config: LexicalSearchConfig,
     *,
+    candidate_pool_size: int | None = None,
     retrieval_config: str = "default",
     cancellation_callback: CancellationCallback | None = None,
 ) -> SearchResponse:
@@ -132,6 +133,11 @@ def lexical_search(
 
     raise_if_cancelled(cancellation_callback)
     started_at = time.perf_counter()
+    result_limit = (
+        request.top_k if candidate_pool_size is None else candidate_pool_size
+    )
+    if not 1 <= result_limit <= 20:
+        raise ValueError("candidate_pool_size must be between 1 and 20")
     query = request.query.strip()
     if not query:
         return _empty_response(request, retrieval_config)
@@ -246,7 +252,7 @@ def lexical_search(
         )
 
     fuzzy_request = request.model_copy(
-        update={"top_k": min(request.top_k, config.fuzzy_limit, 20)}
+        update={"top_k": min(result_limit, config.fuzzy_limit, 20)}
     )
     try:
         fuzzy_response = fuzzy_search(
@@ -285,7 +291,7 @@ def lexical_search(
         requested_backend=request.backend,
         backend="python",
         elapsed_time=time.perf_counter() - started_at,
-        ranked_results=ranked[: request.top_k],
+        ranked_results=ranked[:result_limit],
         warnings=warnings,
         retrieval_config=retrieval_config,
     )

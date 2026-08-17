@@ -15,12 +15,24 @@ from app.acceleration.python_backend import PythonBackend
 from app.core.cancellation import CancellationCallback, raise_if_cancelled
 from app.core.config import Settings, settings as default_settings
 from app.core.coordinator import RepositoryBusyError, RepositoryCoordinator
-from app.core.models import SearchRequest, SearchResponse, SearchResult
+from app.core.models import (
+    RetrievalTiming,
+    SearchRequest,
+    SearchResponse,
+    SearchResult,
+)
 from app.core.repositories import RepositoryResolver, ResolvedRepository
 from app.indexing.embedder import CodeRankEmbedder, Embedder
 from app.indexing.service import INDEX_FORMAT_VERSION
 from app.search.exact import exact_search
 from app.search.fuzzy import fuzzy_search
+from app.search.hybrid import (
+    NormalizedWeightedFusionConfig,
+    ReciprocalRankFusionConfig,
+    normalized_weighted_fusion,
+    reciprocal_rank_fusion,
+    response_candidates,
+)
 from app.search.lexical import LexicalSearchConfig, lexical_search
 from app.search.router import classify_non_exact_query
 from app.search.semantic import (
@@ -214,8 +226,16 @@ class SearchService:
                 retrieval_config=self._retrieval_config,
                 cancellation_callback=cancellation_callback,
             )
-        else:
+        elif request.request_mode == "semantic":
             response = self._semantic_search(
+                store,
+                repository.id,
+                request,
+                resolved.database_path,
+                cancellation_callback,
+            )
+        else:
+            response = self._hybrid_search(
                 store,
                 repository.id,
                 request,
@@ -228,7 +248,12 @@ class SearchService:
             update={
                 "elapsed_time": time.perf_counter() - started_at,
                 "warnings": [*response.warnings, *backend_warnings],
-                "retrieval_config": self._retrieval_config,
+                "retrieval_config": (
+                    response.retrieval_config
+                    if request.request_mode
+                    in {"hybrid_rrf", "hybrid_weighted"}
+                    else self._retrieval_config
+                ),
             }
         )
         return self._bound_snippets(
@@ -326,6 +351,7 @@ class SearchService:
         request: SearchRequest,
         database_path: Path,
         cancellation_callback: CancellationCallback | None,
+        candidate_pool_size: int | None = None,
     ) -> SearchResponse:
         raise_if_cancelled(cancellation_callback)
         cache_key, search_index = self._load_semantic_index(
@@ -356,9 +382,118 @@ class SearchService:
                     self._python_backend if request.backend == "auto" else None
                 ),
                 score_floor=self.settings.semantic_score_floor,
+                candidate_pool_size=candidate_pool_size,
             )
         finally:
             self._release_semantic_index(cache_key)
+
+    def _hybrid_search(
+        self,
+        store: SQLiteIndexStore,
+        repository_id: uuid.UUID,
+        request: SearchRequest,
+        database_path: Path,
+        cancellation_callback: CancellationCallback | None,
+    ) -> SearchResponse:
+        """Generate and fuse bounded candidates from one index snapshot."""
+
+        if request.request_mode == "hybrid_rrf":
+            fusion_config = ReciprocalRankFusionConfig.from_settings(
+                self.settings,
+                final_top_k=request.top_k,
+            )
+        else:
+            fusion_config = NormalizedWeightedFusionConfig.from_settings(
+                self.settings,
+                final_top_k=request.top_k,
+            )
+
+        lexical_request = request.model_copy(
+            update={
+                "request_mode": "lexical",
+            }
+        )
+        lexical_started_at = time.perf_counter()
+        lexical_response = lexical_search(
+            store,
+            repository_id,
+            lexical_request,
+            self._lexical_config,
+            candidate_pool_size=fusion_config.lexical_pool_size,
+            retrieval_config=self._retrieval_config,
+            cancellation_callback=cancellation_callback,
+        )
+        lexical_elapsed = time.perf_counter() - lexical_started_at
+        raise_if_cancelled(cancellation_callback)
+
+        semantic_request = request.model_copy(
+            update={
+                "request_mode": "semantic",
+            }
+        )
+        semantic_started_at = time.perf_counter()
+        # Explicit hybrid modes require semantic retrieval. Any embedding,
+        # index, or backend failure is intentionally allowed to surface.
+        semantic_response = self._semantic_search(
+            store,
+            repository_id,
+            semantic_request,
+            database_path,
+            cancellation_callback,
+            candidate_pool_size=fusion_config.semantic_pool_size,
+        )
+        semantic_elapsed = time.perf_counter() - semantic_started_at
+        raise_if_cancelled(cancellation_callback)
+
+        candidates = [
+            *response_candidates(repository_id, "lexical", lexical_response),
+            *response_candidates(repository_id, "semantic", semantic_response),
+        ]
+        fusion_started_at = time.perf_counter()
+        if isinstance(fusion_config, ReciprocalRankFusionConfig):
+            fused_candidates = reciprocal_rank_fusion(candidates, fusion_config)
+        else:
+            fused_candidates = normalized_weighted_fusion(
+                candidates,
+                fusion_config,
+            )
+        fusion_elapsed = time.perf_counter() - fusion_started_at
+
+        warnings = [
+            *(f"Lexical: {warning}" for warning in lexical_response.warnings),
+            *(f"Semantic: {warning}" for warning in semantic_response.warnings),
+        ]
+        return SearchResponse(
+            original_query=request.query,
+            requested_mode=request.request_mode,
+            mode=request.request_mode,
+            requested_backend=request.backend,
+            backend=semantic_response.backend,
+            elapsed_time=lexical_elapsed + semantic_elapsed + fusion_elapsed,
+            ranked_results=[candidate.result for candidate in fused_candidates],
+            warnings=warnings,
+            retrieval_timings=[
+                RetrievalTiming(
+                    component="lexical",
+                    elapsed_time=lexical_elapsed,
+                    backend="python",
+                ),
+                RetrievalTiming(
+                    component="semantic",
+                    elapsed_time=semantic_elapsed,
+                    backend=semantic_response.backend,
+                ),
+                RetrievalTiming(
+                    component="fusion",
+                    elapsed_time=fusion_elapsed,
+                    backend="python",
+                ),
+            ],
+            retrieval_config=_named_retrieval_config_identity(
+                fusion_config.name,
+                fusion_config.model_dump(mode="json"),
+            ),
+        )
 
     def _load_semantic_index(
         self,
@@ -686,6 +821,19 @@ def _retrieval_config_identity(settings: Settings) -> str:
         "max_fuzzy_candidates": settings.max_fuzzy_candidates,
         "max_semantic_candidates": settings.max_semantic_candidates,
         "semantic_score_floor": settings.semantic_score_floor,
+        "hybrid": {
+            "lexical_pool_size": settings.hybrid_lexical_pool_size,
+            "semantic_pool_size": settings.hybrid_semantic_pool_size,
+            "rrf_k": settings.hybrid_rrf_k,
+            "rrf_lexical_weight": settings.hybrid_rrf_lexical_weight,
+            "rrf_semantic_weight": settings.hybrid_rrf_semantic_weight,
+            "weighted_lexical_weight": settings.hybrid_weighted_lexical_weight,
+            "weighted_semantic_weight": settings.hybrid_weighted_semantic_weight,
+            "weighted_missing_source_value": (
+                settings.hybrid_weighted_missing_source_value
+            ),
+            "tie_breaking_version": settings.hybrid_tie_breaking_version,
+        },
         "lexical": {
             "exact_qualified_bonus": settings.lexical_exact_qualified_bonus,
             "exact_short_bonus": settings.lexical_exact_short_bonus,
@@ -711,3 +859,14 @@ def _retrieval_config_identity(settings: Settings) -> str:
     encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
     digest = hashlib.sha256(encoded).hexdigest()[:12]
     return f"{settings.retrieval_config_name}:{digest}"
+
+
+def _named_retrieval_config_identity(
+    name: str,
+    values: dict[str, object],
+) -> str:
+    """Return a stable identity for one serializable named configuration."""
+
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(encoded).hexdigest()[:12]
+    return f"{name}:{digest}"

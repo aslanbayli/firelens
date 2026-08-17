@@ -174,6 +174,7 @@ def semantic_search(
     backend: AccelerationBackend = _PYTHON_BACKEND,
     fallback_backend: AccelerationBackend | None = None,
     score_floor: float | None = None,
+    candidate_pool_size: int | None = None,
 ) -> SearchResponse:
     """Search stored code chunks by cosine similarity."""
 
@@ -192,8 +193,11 @@ def semantic_search(
             warnings=[],
         )
 
-    if request.top_k <= 0:
-        raise ValueError("top_k must be greater than 0")
+    result_limit = (
+        request.top_k if candidate_pool_size is None else candidate_pool_size
+    )
+    if not 1 <= result_limit <= 20:
+        raise ValueError("candidate_pool_size must be between 1 and 20")
 
     repository = store.load_repository(repository_id)
     raise_if_cancelled(cancellation_callback)
@@ -279,7 +283,7 @@ def semantic_search(
         ranked_scores = active_backend.semantic_top_k(
             matrix,
             normalized_query,
-            request.top_k,
+            result_limit,
         )
     except AccelerationError:
         if fallback_backend is None:
@@ -288,7 +292,7 @@ def semantic_search(
         ranked_scores = active_backend.semantic_top_k(
             matrix,
             normalized_query,
-            request.top_k,
+            result_limit,
         )
         warnings.append("Mojo semantic acceleration failed; using Python")
     raise_if_cancelled(cancellation_callback)
@@ -324,6 +328,7 @@ def semantic_search(
                 start_line=candidate.start_line,
                 end_line=candidate.end_line,
                 symbol_name=bounded_symbol_name(candidate.qualified_symbol_name),
+                symbol_id=candidate.symbol_id,
                 language=candidate.language,
                 semantic_unit_kind=candidate.semantic_unit_kind,
                 snippet=snippet,
